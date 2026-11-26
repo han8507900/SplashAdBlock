@@ -4,19 +4,20 @@
 #import "SplashAdBlockPrivate.h"
 
 // ============================================================================
-// 通用屏蔽插件（v0.0.5）
+// 通用屏蔽插件（v0.0.9 清理版）
 //
 // 已适配：
 //  · 掌盟 com.tencent.ied.app.lolbible —— 广点通 GDT 开屏广告（透明化方案）
 //  · 闪联 com.shanlian.pro             —— 评分弹窗
-//  · 什么值得买 com.smzdm.client.ios   —— 开屏广告（本次新增，通用兜底 + 探针）
+//  · 什么值得买 com.smzdm.client.ios   —— 开屏广告（SMFullWindowAdView 精准透明化）
 //
-// 什么值得买策略（SDK 未知，故通用兜底 + 探针二合一）：
-//  1) 高 level 独立 UIWindow 出现（启动 15s 内、level 100~3000）-> 整棵树透明化
-//  2) 出现类名含 splash/launch/openScreen 等的 VC -> 透明化并延迟补刀
-//  3) 探针：dump 命中的广告 SDK 类名、窗口、VC 写到 SplashAdBlock_smzdm.log
-//     万一没命中，下一版按真实类名精准 hook。
-//  全程只做 alpha=0，不改 hidden、不掐断加载、不碰回调链 -> 不卡启动、不重弹。
+// v0.0.9 相对 v0.0.8 的变化（只清理，不动任何屏蔽逻辑）：
+//  · 删除 smzdm 全部调试探针：SDK 类名 dump / 方法列表 dump / 视图树 dump /
+//    启动 tick 循环 / UIWindowDidBecomeVisible 常驻观察者 / VC viewDidAppear 探针
+//  · 日志从「4 路径全写」改为「App 沙盒 Documents 单写」，且只在关键事件写
+//  · 启动时自动清理本 App 旧日志，只保留最近 2 份，避免累积
+//  · /tmp 加载标记改为固定文件名覆盖写，不再每次启动生成新文件
+//  · 全程仍然只做 alpha=0，不 hidden、不移除、不掐断加载、不碰回调链
 // ============================================================================
 
 static BOOL splash_adblock_enabled(void) {
@@ -38,14 +39,11 @@ static BOOL splash_adblock_isSmzdm(void) {
     return [b isEqualToString:@"com.smzdm.client.ios"];
 }
 
-// 启动时间戳（用于把兜底限制在启动初期，避免误伤后续正常弹窗）
-static NSTimeInterval splash_adblock_launchTime = 0;
+// ---------- 轻量日志（单路径 + 自动清理，无常驻监听、无轮询） ----------
+#define SPLASH_ADBLOCK_VERSION @"0.0.9"
 
-// ---------- 轻量日志（多点冗余写入；无常驻轮询） ----------
-#define SPLASH_ADBLOCK_VERSION @"0.0.8"
-
-// 本次会话的唯一标志（版本号 + 启动时间戳），整个进程内只生成一次，
-// 让每次装机/每次启动的日志文件名都不同，避免同名文件混淆。
+// 本次会话的唯一标志（版本号 + 启动时间戳），进程内只生成一次。
+// 日志文件名继续带标志位，沿用既有约定，便于确认是哪一版、哪一次启动。
 static NSString *splash_adblock_runStamp(void) {
     static NSString *stamp = nil;
     static dispatch_once_t onceToken;
@@ -73,53 +71,75 @@ static NSString *splash_adblock_logName(void) {
             splash_adblock_logTag(), splash_adblock_runStamp()];
 }
 
-// 写日志到多个位置，任何一个成功即可找到。
-// 有的 App 沙盒严格，写不进 /var/mobile/Documents/，所以同时写 App 沙盒和 /tmp。
-static NSArray *splash_adblock_logPaths(void) {
-    NSString *name = splash_adblock_logName();
-    NSMutableArray *paths = [NSMutableArray array];
-    [paths addObject:[@"/var/mobile/Documents/" stringByAppendingPathComponent:name]];
-    [paths addObject:[@"/tmp/" stringByAppendingPathComponent:name]];
-    // App 自己的沙盒 Documents（一定可写）
+// 只写 App 沙盒 Documents（已验证三个目标 App 均可写），不再四路径全写。
+static NSString *splash_adblock_logPath(void) {
     NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-    if (docs.firstObject) [paths addObject:[docs.firstObject stringByAppendingPathComponent:name]];
-    // App 沙盒 Library/Caches（一定可写）
-    NSArray *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
-    if (caches.firstObject) [paths addObject:[caches.firstObject stringByAppendingPathComponent:name]];
-    return paths;
+    NSString *dir = docs.firstObject ?: @"/tmp";
+    return [dir stringByAppendingPathComponent:splash_adblock_logName()];
 }
 
 static void splash_adblock_log(NSString *line) {
     NSData *data = [[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
-    for (NSString *path in splash_adblock_logPaths()) {
-        @try {
-            NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:path];
-            if (h) {
-                [h seekToEndOfFile];
-                [h writeData:data];
-                [h closeFile];
-            } else {
-                [data writeToFile:path atomically:YES];
-            }
-        } @catch (NSException *e) {
-            // 某个路径写不进不影响其它路径
+    NSString *path = splash_adblock_logPath();
+    @try {
+        NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (h) {
+            [h seekToEndOfFile];
+            [h writeData:data];
+            [h closeFile];
+        } else {
+            [data writeToFile:path atomically:YES];
+        }
+    } @catch (NSException *e) {
+        // 写日志失败不影响屏蔽功能
+    }
+}
+
+// 启动时清理本 App 历史日志，每个目录最多保留最近 2 份（当前 + 上 1 份）。
+// 只删本插件前缀的文件，不碰 App 自己的任何数据。
+static void splash_adblock_pruneOldLogs(void) {
+    NSString *prefix = [NSString stringWithFormat:@"SplashAdBlock_%@_v", splash_adblock_logTag()];
+    NSMutableArray *dirs = [NSMutableArray array];
+    NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    if (docs.firstObject) [dirs addObject:docs.firstObject];
+    NSArray *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
+    if (caches.firstObject) [dirs addObject:caches.firstObject];
+    [dirs addObject:@"/tmp"];
+    [dirs addObject:@"/var/mobile/Documents"];
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *dir in dirs) {
+        NSArray *files = [fm contentsOfDirectoryAtPath:dir error:nil];
+        NSMutableArray *oldLogs = [NSMutableArray array];
+        for (NSString *f in files) {
+            if (![f hasPrefix:prefix] || ![f hasSuffix:@".log"]) continue;
+            NSString *full = [dir stringByAppendingPathComponent:f];
+            NSDictionary *attr = [fm attributesOfItemAtPath:full error:nil];
+            NSDate *date = attr[NSFileModificationDate] ?: [NSDate distantPast];
+            [oldLogs addObject:@{@"path": full, @"date": date}];
+        }
+        if (oldLogs.count <= 2) continue;
+        [oldLogs sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+            return [b[@"date"] compare:a[@"date"]]; // 新在前
+        }];
+        for (NSUInteger i = 2; i < oldLogs.count; i++) {
+            [fm removeItemAtPath:oldLogs[i][@"path"] error:nil];
         }
     }
 }
 
-// 在 /tmp 放一个一眼可见的"加载标记"，用于直接确认 dylib 是否真的被注入。
-// 打开文件就能确认插件进没进这个 App，不用再猜。
+// /tmp 加载标记：固定文件名覆盖写，内容里带 stamp，一眼可见且不累积。
 static void splash_adblock_writeLoadedMarker(void) {
     NSString *bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"unknown";
     NSString *content = [NSString stringWithFormat:
-        @"SplashAdBlock LOADED\nbundle=%@\nversion=%@\ntime=%.0f\n",
-        bundle, SPLASH_ADBLOCK_VERSION, [[NSDate date] timeIntervalSince1970]];
-    NSString *marker = [NSString stringWithFormat:@"/tmp/SplashAdBlock_LOADED_%@_%@",
-                        splash_adblock_logTag(), splash_adblock_runStamp()];
+        @"SplashAdBlock LOADED\nbundle=%@\nversion=%@\nstamp=%@\ntime=%.0f\n",
+        bundle, SPLASH_ADBLOCK_VERSION, splash_adblock_runStamp(), [[NSDate date] timeIntervalSince1970]];
+    NSString *marker = [NSString stringWithFormat:@"/tmp/SplashAdBlock_LOADED_%@",
+                        splash_adblock_logTag()];
     [content writeToFile:marker atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
-// ---------- 透明化工具 ----------
+// ---------- 透明化工具（保留完整展示/计时/回调链） ----------
 static void splash_adblock_fadeTree(UIView *view) {
     if (!view) return;
     view.alpha = 0.0;
@@ -137,149 +157,7 @@ static void splash_adblock_scheduleFade(UIViewController *vc) {
             UIView *adWindow = strongVC.view.window;
             if (!adWindow) return;
             splash_adblock_fadeTree(adWindow);
-            splash_adblock_log(@"[fade] ad window tree alpha -> 0");
         });
-    }
-}
-
-static void splash_adblock_fadeWindowWithDelays(UIWindow *win) {
-    __weak UIWindow *weakWin = win;
-    NSArray *delays = @[@0.02, @0.1, @0.3, @0.7, @1.5];
-    for (NSNumber *d in delays) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            UIWindow *w = weakWin;
-            if (!w) return;
-            splash_adblock_fadeTree(w);
-            splash_adblock_log(@"[fade] high-level window tree alpha -> 0");
-        });
-    }
-}
-
-// ---------- 什么值得买：开屏特征判断 + SDK 探针 ----------
-static BOOL splash_adblock_nameLooksLikeSplash(NSString *name) {
-    if (!name || name.length == 0) return NO;
-    NSString *lower = [name lowercaseString];
-    NSArray *keys = @[@"splash", @"openscreen", @"openads", @"launchad", @"startupad",
-                      @"flashad", @"splashad", @"开屏", @"广告页"];
-    for (NSString *k in keys) {
-        if ([lower rangeOfString:k].location != NSNotFound) return YES;
-    }
-    return NO;
-}
-
-static void splash_adblock_dumpSDKClasses(void) {
-    NSMutableArray *hits = [NSMutableArray array];
-    NSArray *keys = @[@"GDTSplash", @"GDTAd", @"GDTSDK", @"BUSplash", @"BUAdSDK",
-                      @"BUNativeExpressSplash", @"KSAd", @"ABU", @"Sigmob",
-                      @"SplashAd", @"SplashView", @"SplashController"];
-    unsigned int count = 0;
-    Class *classes = objc_copyClassList(&count);
-    if (classes) {
-        for (unsigned int i = 0; i < count; i++) {
-            NSString *name = NSStringFromClass(classes[i]);
-            for (NSString *k in keys) {
-                if ([name rangeOfString:k options:NSCaseInsensitiveSearch].location != NSNotFound) {
-                    [hits addObject:name];
-                    break;
-                }
-            }
-        }
-        free(classes);
-    }
-    splash_adblock_log([NSString stringWithFormat:@"[sdk] matched %lu classes:", (unsigned long)hits.count]);
-    NSUInteger limit = MIN(hits.count, 150);
-    for (NSUInteger i = 0; i < limit; i++) {
-        splash_adblock_log([NSString stringWithFormat:@"   %@", hits[i]]);
-    }
-}
-
-// ---------- 什么值得买：dump 开屏类方法列表 + 完整视图树（定位真实广告 view） ----------
-static void splash_adblock_dumpSplashMethods(void) {
-    NSMutableArray *targets = [NSMutableArray array];
-    unsigned int count = 0;
-    Class *classes = objc_copyClassList(&count);
-    if (classes) {
-        for (unsigned int i = 0; i < count; i++) {
-            NSString *name = NSStringFromClass(classes[i]);
-            NSString *lower = [name lowercaseString];
-            if ([lower rangeOfString:@"splash"].location != NSNotFound
-                || [name hasPrefix:@"ABU"]
-                || [lower rangeOfString:@"jgads"].location != NSNotFound
-                || [lower rangeOfString:@"busplash"].location != NSNotFound) {
-                [targets addObject:name];
-            }
-        }
-        free(classes);
-    }
-    NSUInteger lim = MIN(targets.count, 80);
-    splash_adblock_log([NSString stringWithFormat:@"[methods] splash-like classes=%lu (dump %lu)",
-                        (unsigned long)targets.count, (unsigned long)lim]);
-    for (NSUInteger i = 0; i < lim; i++) {
-        NSString *n = targets[i];
-        Class c = NSClassFromString(n);
-        if (!c) continue;
-        unsigned int mc = 0;
-        Method *ms = class_copyMethodList(c, &mc);
-        NSMutableArray *sels = [NSMutableArray array];
-        for (unsigned int j = 0; j < mc; j++) {
-            [sels addObject:NSStringFromSelector(method_getName(ms[j]))];
-        }
-        if (ms) free(ms);
-        splash_adblock_log([NSString stringWithFormat:@"[CLASS] %@ :: %@", n,
-                            [sels componentsJoinedByString:@", "]]);
-    }
-}
-
-static void splash_adblock_dumpViewTree(UIView *v, NSInteger depth, NSMutableString *out) {
-    if (!v || depth > 8) return;
-    CGRect f = v.frame;
-    NSString *pad = [@"" stringByPaddingToLength:depth * 2 withString:@" " startingAtIndex:0];
-    [out appendFormat:@"%@%@ (%.0f,%.0f %.0fx%.0f) a=%.2f h=%d\n", pad,
-        NSStringFromClass([v class]), f.origin.x, f.origin.y, f.size.width, f.size.height,
-        v.alpha, v.hidden];
-    for (UIView *sub in v.subviews) splash_adblock_dumpViewTree(sub, depth + 1, out);
-}
-
-static void splash_adblock_dumpWindows(void) {
-    for (UIWindow *w in [UIApplication sharedApplication].windows) {
-        NSMutableString *out = [NSMutableString stringWithFormat:
-            @"[tree] WINDOW level=%.0f root=%@ bounds=%@\n",
-            w.windowLevel, NSStringFromClass([w.rootViewController class]), NSStringFromCGRect(w.bounds)];
-        for (UIView *v in w.subviews) splash_adblock_dumpViewTree(v, 0, out);
-        splash_adblock_log(out);
-    }
-}
-
-// 兜底：把 window 上"类名含广告特征 + 接近全屏"的 view 透明化（保留回调链）。
-static void splash_adblock_fadeAdViewRecursive(UIView *v, UIWindow *win, BOOL isRoot) {
-    if (!v || isRoot) return;
-    NSString *cls = NSStringFromClass([v class]);
-    NSString *lower = [cls lowercaseString];
-    BOOL adName = NO;
-    NSArray *adKeys = @[@"splash", @"abu", @"csj", @"pangle", @"jgads", @"busplash",
-                        @"gdt", @"interstitial", @"splashad", @"smfullwindowad", @"smad"];
-    for (NSString *k in adKeys) {
-        if ([lower rangeOfString:k].location != NSNotFound) { adName = YES; break; }
-    }
-    CGRect f = v.frame;
-    CGSize s = win.bounds.size;
-    BOOL fullscreen = s.width > 0 && f.size.width >= s.width * 0.8
-                      && f.size.height >= s.height * 0.5;
-    if (adName && fullscreen) {
-        splash_adblock_log([NSString stringWithFormat:@"[MATCH] smzdm ad view %@ frame=%@ -> fade",
-                            cls, NSStringFromCGRect(f)]);
-        splash_adblock_fadeTree(v);
-    }
-    BOOL childIsRoot = [v isEqual:win.rootViewController.view];
-    for (UIView *sub in v.subviews) splash_adblock_fadeAdViewRecursive(sub, win, childIsRoot);
-}
-
-static void splash_adblock_fadeFullscreenAdViews(void) {
-    for (UIWindow *w in [UIApplication sharedApplication].windows) {
-        for (UIView *v in w.subviews) {
-            splash_adblock_fadeAdViewRecursive(v, w, [v isEqual:w.rootViewController.view]);
-        }
     }
 }
 
@@ -373,55 +251,34 @@ static BOOL splash_adblock_viewLooksLikeRating(UIView *view, NSString **matchedT
 }
 %end
 
-#pragma mark - 全局 VC hook：闪联评分弹窗 + 什么值得买开屏探针
+#pragma mark - 闪联评分弹窗（仅闪联生效，事件驱动）
 
 %hook UIViewController
 - (void)presentViewController:(UIViewController *)vc animated:(BOOL)animated completion:(void (^)(void))completion {
     %orig;
 
-    if (!splash_adblock_enabled()) return;
+    if (!splash_adblock_enabled() || !splash_adblock_isShanlian()) return;
+    if (!vc) return;
 
-    // ---- 闪联评分弹窗 ----
-    if (splash_adblock_isShanlian()) {
-        if (!vc) return;
-        NSString *vcName = NSStringFromClass([vc class]);
-        NSString *title = vc.title;
-        NSString *msg = [vc isKindOfClass:[UIAlertController class]] ? ((UIAlertController *)vc).message : nil;
-        splash_adblock_log([NSString stringWithFormat:@"[probe] present VC=%@ title='%@' msg='%@'",
-                            vcName, title ?: @"", msg ?: @""]);
-        NSString *matched = nil;
-        BOOL hit = splash_adblock_textLooksLikeRating(title)
-                || splash_adblock_textLooksLikeRating(msg)
-                || splash_adblock_viewLooksLikeRating(vc.view, &matched);
-        if (hit) {
-            splash_adblock_log([NSString stringWithFormat:@"[MATCH] rating popup VC=%@ matched='%@'",
-                                vcName, matched ?: (title ?: (msg ?: @""))]);
-            __weak UIViewController *weakVC = vc;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.02 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                UIViewController *strongVC = weakVC;
-                if (!strongVC) return;
-                splash_adblock_fadeTree(strongVC.view);
-                [strongVC dismissViewControllerAnimated:NO completion:nil];
-                splash_adblock_log(@"[closed] rating popup dismissed");
-            });
-        }
-    }
-}
-
-- (void)viewDidAppear:(BOOL)animated {
-    %orig;
-
-    if (!splash_adblock_enabled() || !splash_adblock_isSmzdm()) return;
-
-    NSString *cls = NSStringFromClass([self class]);
-    UIWindow *win = self.view.window;
-    splash_adblock_log([NSString stringWithFormat:@"[probe] smzdm VC=%@ winLevel=%.0f",
-                        cls, win ? win.windowLevel : -1]);
-
-    if (splash_adblock_nameLooksLikeSplash(cls)) {
-        splash_adblock_log([NSString stringWithFormat:@"[MATCH] smzdm splash VC=%@", cls]);
-        splash_adblock_scheduleFade(self);
+    NSString *vcName = NSStringFromClass([vc class]);
+    NSString *title = vc.title;
+    NSString *msg = [vc isKindOfClass:[UIAlertController class]] ? ((UIAlertController *)vc).message : nil;
+    NSString *matched = nil;
+    BOOL hit = splash_adblock_textLooksLikeRating(title)
+            || splash_adblock_textLooksLikeRating(msg)
+            || splash_adblock_viewLooksLikeRating(vc.view, &matched);
+    if (hit) {
+        splash_adblock_log([NSString stringWithFormat:@"[MATCH] rating popup VC=%@ matched='%@'",
+                            vcName, matched ?: (title ?: (msg ?: @""))]);
+        __weak UIViewController *weakVC = vc;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.02 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            UIViewController *strongVC = weakVC;
+            if (!strongVC) return;
+            splash_adblock_fadeTree(strongVC.view);
+            [strongVC dismissViewControllerAnimated:NO completion:nil];
+            splash_adblock_log(@"[closed] rating popup dismissed");
+        });
     }
 }
 %end
@@ -429,56 +286,14 @@ static BOOL splash_adblock_viewLooksLikeRating(UIView *view, NSString **matchedT
 %ctor {
     @autoreleasepool {
         (void)splash_adblock_enabled();
-        splash_adblock_launchTime = [[NSDate date] timeIntervalSince1970];
         NSString *bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"unknown";
 
-        // 1) 写一个一眼可见的加载标记到 /tmp
+        // 固定名加载标记（覆盖写，不累积）+ 启动时一行日志（带标志位）
         splash_adblock_writeLoadedMarker();
-
-        // 2) 启动日志 + 每个写入路径的成败诊断
         splash_adblock_log([NSString stringWithFormat:@"=== SplashAdBlock active v%@ bundle=%@ stamp=%@ ===",
                             SPLASH_ADBLOCK_VERSION, bundle, splash_adblock_runStamp()]);
-        for (NSString *p in splash_adblock_logPaths()) {
-            BOOL ok = [[NSFileManager defaultManager] isWritableFileAtPath:[p stringByDeletingLastPathComponent]];
-            splash_adblock_log([NSString stringWithFormat:@"[path] writable=%d %@", ok, p]);
-        }
 
-        if (splash_adblock_isSmzdm()) {
-            // 延迟 2s dump 广告 SDK 类名 + 开屏类方法列表（等类注册完成）
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                splash_adblock_dumpSDKClasses();
-                splash_adblock_dumpSplashMethods();
-            });
-
-            // 在开屏出现的几个关键时间点 dump 视图树 + 尝试兜底透明化广告 view
-            NSArray *ticks = @[@0.3, @0.8, @1.5, @3.0];
-            for (NSNumber *t in ticks) {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(t.doubleValue * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{
-                    if (!splash_adblock_enabled() || !splash_adblock_isSmzdm()) return;
-                    splash_adblock_log([NSString stringWithFormat:@"[tree] === tick %.1fs ===", t.doubleValue]);
-                    splash_adblock_dumpWindows();
-                    splash_adblock_fadeFullscreenAdViews();
-                });
-            }
-
-            // 兜底：监听高 level 独立 window 出现（启动 15s 内）
-            [[NSNotificationCenter defaultCenter] addObserverForName:UIWindowDidBecomeVisibleNotification
-                object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
-                if (!splash_adblock_enabled() || !splash_adblock_isSmzdm()) return;
-                UIWindow *win = note.object;
-                if (![win isKindOfClass:[UIWindow class]]) return;
-                NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-                if (now - splash_adblock_launchTime > 15) return;
-                CGFloat level = win.windowLevel;
-                splash_adblock_log([NSString stringWithFormat:@"[probe] smzdm win visible level=%.0f root=%@",
-                                    level, NSStringFromClass([win.rootViewController class])]);
-                if (level > 100 && level < 3000) {
-                    splash_adblock_log(@"[MATCH] smzdm high-level window -> fade");
-                    splash_adblock_fadeWindowWithDelays(win);
-                }
-            }];
-        }
+        // 清理本 App 历史日志，只保留最近 2 份（当前这份是最新的，不会被删）
+        splash_adblock_pruneOldLogs();
     }
 }

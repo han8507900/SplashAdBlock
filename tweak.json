@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "name": "SplashAdBlock",
+  "id": "splashadblock",
+  "display_name": "开屏广告屏蔽",
+  "class_prefix": "AxsSplashAdBlock",
+  "symbol_prefix": "axs_splashadblock",
+  "package": "com.hzy.splashadblock",
+  "bundle": "com.tencent.ied.app.lolbible",
+  "sdk_version": "16.5",
+  "minimum_ios": "15.0",
+  "preferences": false,
+  "slider": false,
+  "github_actions": true
+}

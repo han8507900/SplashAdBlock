@@ -6,14 +6,12 @@
 // 参数统一用 id 通配，避免依赖未知的内部类型。
 
 @interface GDTSplashAd : NSObject
-- (void)showSplashWithOrder:(id)arg1 withCustomUI:(id)arg2;
-- (void)showSplashWithOrder:(id)arg1 withCustomUI:(id)arg2 inContainerView:(id)arg3;
-- (void)preLoadSplashOrder:(id)arg1;
-- (void)loadAdAndShowSplashWithCustomUIModel:(id)arg1;
+// 开屏广告停留时长（秒）。秒跳过的核心：不改回调链，只压缩时长。
+- (double)fetchDelay;
+- (void)setFetchDelay:(double)arg1;
 @end
 
 @interface TGGDTSplashViewController : UIViewController
-- (void)splashViewShowWithModel:(id)arg1 animBegin:(id)arg2 animEnd:(id)arg3 cacheWebView:(id)arg4;
 - (void)viewDidAppear:(BOOL)animated;
 @end
 
@@ -23,5 +21,4 @@
 @end
 
 @interface TGGDTSplashWindowView : UIView
-- (void)splashViewShowWithModel:(id)arg1 animBegin:(id)arg2 animEnd:(id)arg3 cacheWebView:(id)arg4;
 @end

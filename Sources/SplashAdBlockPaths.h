@@ -8,7 +8,7 @@
 #import <rootless.h>
 #endif
 
-static inline NSString *axs_splashadblock_resourcePath(NSString *rootfsPath) {
+static inline NSString *splash_adblock_resourcePath(NSString *rootfsPath) {
 #ifdef THEOS_PACKAGE_SCHEME_ROOTHIDE
     return jbroot(rootfsPath);
 #else
@@ -16,7 +16,7 @@ static inline NSString *axs_splashadblock_resourcePath(NSString *rootfsPath) {
 #endif
 }
 
-static inline NSString *axs_splashadblock_preferencesPath(void) {
+static inline NSString *splash_adblock_preferencesPath(void) {
     NSString *path = @"/var/mobile/Library/Preferences/com.hzy.splashadblock.plist";
 #ifdef THEOS_PACKAGE_SCHEME_ROOTHIDE
     return jbroot(path);

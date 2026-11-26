@@ -2,29 +2,29 @@
 
 #import <Foundation/Foundation.h>
 #import <CoreFoundation/CoreFoundation.h>
-#import "AxsSplashAdBlockPaths.h"
+#import "SplashAdBlockPaths.h"
 
-static NSString * const AxsSplashAdBlockPreferencesDomain = @"com.hzy.splashadblock";
-static NSString * const AxsSplashAdBlockPreferencesChanged = @"com.hzy.splashadblock.preferences-changed";
+static NSString * const SplashAdBlockPreferencesDomain = @"com.hzy.splashadblock";
+static NSString * const SplashAdBlockPreferencesChanged = @"com.hzy.splashadblock.preferences-changed";
 
-static inline NSDictionary *axs_splashadblock_readPreferences(void) {
-    NSString *path = axs_splashadblock_preferencesPath();
+static inline NSDictionary *splash_adblock_readPreferences(void) {
+    NSString *path = splash_adblock_preferencesPath();
     NSDictionary *values = path.length > 0 ? [NSDictionary dictionaryWithContentsOfFile:path] : nil;
     if ([values isKindOfClass:[NSDictionary class]]) {
         return values;
     }
     // Compatibility fallback, not a second writable file location.
-    NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:AxsSplashAdBlockPreferencesDomain];
+    NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:SplashAdBlockPreferencesDomain];
     [defaults synchronize];
-    return [defaults persistentDomainForName:AxsSplashAdBlockPreferencesDomain] ?: @{};
+    return [defaults persistentDomainForName:SplashAdBlockPreferencesDomain] ?: @{};
 }
 
 // The PreferenceBundle is the only caller allowed to write.
-static inline BOOL axs_splashadblock_writePreference(NSString *key, id value, NSError **error) {
-    NSString *path = axs_splashadblock_preferencesPath();
+static inline BOOL splash_adblock_writePreference(NSString *key, id value, NSError **error) {
+    NSString *path = splash_adblock_preferencesPath();
     if (key.length == 0 || path.length == 0) {
         if (error) {
-            *error = [NSError errorWithDomain:AxsSplashAdBlockPreferencesDomain code:1
+            *error = [NSError errorWithDomain:SplashAdBlockPreferencesDomain code:1
                                     userInfo:@{NSLocalizedDescriptionKey: @"Invalid preference path or key"}];
         }
         return NO;
@@ -37,14 +37,14 @@ static inline BOOL axs_splashadblock_writePreference(NSString *key, id value, NS
                          options:NSPropertyListMutableContainers format:NULL error:error] : nil;
         if (![decoded isKindOfClass:[NSDictionary class]]) {
             if (error && !*error) {
-                *error = [NSError errorWithDomain:AxsSplashAdBlockPreferencesDomain code:2
+                *error = [NSError errorWithDomain:SplashAdBlockPreferencesDomain code:2
                                         userInfo:@{NSLocalizedDescriptionKey: @"Preferences are not a dictionary"}];
             }
             return NO;
         }
         values = [decoded mutableCopy];
     } else {
-        values = [axs_splashadblock_readPreferences() mutableCopy];
+        values = [splash_adblock_readPreferences() mutableCopy];
     }
     if (value) values[key] = value;
     else [values removeObjectForKey:key];
@@ -57,11 +57,11 @@ static inline BOOL axs_splashadblock_writePreference(NSString *key, id value, NS
     if (!data || ![data writeToFile:path options:NSDataWritingAtomic error:error]) {
         return NO;
     }
-    NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:AxsSplashAdBlockPreferencesDomain];
+    NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:SplashAdBlockPreferencesDomain];
     // Mirror the whole snapshot so cfprefsd cannot flush stale unrelated keys.
-    [defaults setPersistentDomain:values forName:AxsSplashAdBlockPreferencesDomain];
+    [defaults setPersistentDomain:values forName:SplashAdBlockPreferencesDomain];
     [defaults synchronize];
     CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
-        (__bridge CFStringRef)AxsSplashAdBlockPreferencesChanged, NULL, NULL, true);
+        (__bridge CFStringRef)SplashAdBlockPreferencesChanged, NULL, NULL, true);
     return YES;
 }

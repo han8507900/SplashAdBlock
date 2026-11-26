@@ -1,23 +1,23 @@
-#import "AxsSplashAdBlockConfig.h"
-#import "AxsSplashAdBlockPreferences.h"
+#import "SplashAdBlockConfig.h"
+#import "SplashAdBlockPreferences.h"
 
-@interface AxsSplashAdBlockConfig ()
+@interface SplashAdBlockConfig ()
 @property (atomic, copy) NSDictionary *snapshot;
 @property (nonatomic, strong) dispatch_queue_t reloadQueue;
 @end
 
-static void axs_splashadblock_preferencesDidChange(CFNotificationCenterRef center, void *observer,
+static void splash_adblock_preferencesDidChange(CFNotificationCenterRef center, void *observer,
                                           CFStringRef name, const void *object, CFDictionaryRef info) {
-    AxsSplashAdBlockConfig *config = (__bridge AxsSplashAdBlockConfig *)observer;
+    SplashAdBlockConfig *config = (__bridge SplashAdBlockConfig *)observer;
     dispatch_async(config.reloadQueue, ^{
-        [config axs_splashadblock_reload];
+        [config splash_adblock_reload];
     });
 }
 
-@implementation AxsSplashAdBlockConfig
+@implementation SplashAdBlockConfig
 
-+ (instancetype)axs_splashadblock_shared {
-    static AxsSplashAdBlockConfig *instance;
++ (instancetype)splash_adblock_shared {
+    static SplashAdBlockConfig *instance;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         instance = [[self alloc] init];
@@ -29,30 +29,30 @@ static void axs_splashadblock_preferencesDidChange(CFNotificationCenterRef cente
     self = [super init];
     if (self) {
         _reloadQueue = dispatch_queue_create("com.hzy.splashadblock.preferences", DISPATCH_QUEUE_SERIAL);
-        [self axs_splashadblock_reload];
+        [self splash_adblock_reload];
         CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
-            (__bridge const void *)self, axs_splashadblock_preferencesDidChange,
-            (__bridge CFStringRef)AxsSplashAdBlockPreferencesChanged, NULL,
+            (__bridge const void *)self, splash_adblock_preferencesDidChange,
+            (__bridge CFStringRef)SplashAdBlockPreferencesChanged, NULL,
             CFNotificationSuspensionBehaviorDeliverImmediately);
         // Close the window between the first read and observer registration.
-        dispatch_async(_reloadQueue, ^{ [self axs_splashadblock_reload]; });
+        dispatch_async(_reloadQueue, ^{ [self splash_adblock_reload]; });
     }
     return self;
 }
 
-- (void)axs_splashadblock_reload {
-    self.snapshot = axs_splashadblock_readPreferences();
+- (void)splash_adblock_reload {
+    self.snapshot = splash_adblock_readPreferences();
     dispatch_async(dispatch_get_main_queue(), ^{
-        [[NSNotificationCenter defaultCenter] postNotificationName:AxsSplashAdBlockPreferencesChanged object:self];
+        [[NSNotificationCenter defaultCenter] postNotificationName:SplashAdBlockPreferencesChanged object:self];
     });
 }
 
-- (id)axs_splashadblock_valueForKey:(NSString *)key defaultValue:(id)defaultValue {
+- (id)splash_adblock_valueForKey:(NSString *)key defaultValue:(id)defaultValue {
     return self.snapshot[key] ?: defaultValue;
 }
 
-- (BOOL)axs_splashadblock_isEnabled {
-    id value = [self axs_splashadblock_valueForKey:@"enabled" defaultValue:@(YES)];
+- (BOOL)splash_adblock_isEnabled {
+    id value = [self splash_adblock_valueForKey:@"enabled" defaultValue:@(YES)];
     return [value isKindOfClass:[NSNumber class]] ? [value boolValue] : YES;
 }
 

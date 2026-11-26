@@ -172,6 +172,95 @@ static void splash_adblock_dumpSDKClasses(void) {
     }
 }
 
+// ---------- 什么值得买：dump 开屏类方法列表 + 完整视图树（定位真实广告 view） ----------
+static void splash_adblock_dumpSplashMethods(void) {
+    NSMutableArray *targets = [NSMutableArray array];
+    unsigned int count = 0;
+    Class *classes = objc_copyClassList(&count);
+    if (classes) {
+        for (unsigned int i = 0; i < count; i++) {
+            NSString *name = NSStringFromClass(classes[i]);
+            NSString *lower = [name lowercaseString];
+            if ([lower rangeOfString:@"splash"].location != NSNotFound
+                || [name hasPrefix:@"ABU"]
+                || [lower rangeOfString:@"jgads"].location != NSNotFound
+                || [lower rangeOfString:@"busplash"].location != NSNotFound) {
+                [targets addObject:name];
+            }
+        }
+        free(classes);
+    }
+    NSUInteger lim = MIN(targets.count, 80);
+    splash_adblock_log([NSString stringWithFormat:@"[methods] splash-like classes=%lu (dump %lu)",
+                        (unsigned long)targets.count, (unsigned long)lim]);
+    for (NSUInteger i = 0; i < lim; i++) {
+        NSString *n = targets[i];
+        Class c = NSClassFromString(n);
+        if (!c) continue;
+        unsigned int mc = 0;
+        Method *ms = class_copyMethodList(c, &mc);
+        NSMutableArray *sels = [NSMutableArray array];
+        for (unsigned int j = 0; j < mc; j++) {
+            [sels addObject:NSStringFromSelector(method_getName(ms[j]))];
+        }
+        if (ms) free(ms);
+        splash_adblock_log([NSString stringWithFormat:@"[CLASS] %@ :: %@", n,
+                            [sels componentsJoinedByString:@", "]]);
+    }
+}
+
+static void splash_adblock_dumpViewTree(UIView *v, NSInteger depth, NSMutableString *out) {
+    if (!v || depth > 8) return;
+    CGRect f = v.frame;
+    NSString *pad = [@"" stringByPaddingToLength:depth * 2 withString:@" " startingAtIndex:0];
+    [out appendFormat:@"%@%@ (%.0f,%.0f %.0fx%.0f) a=%.2f h=%d\n", pad,
+        NSStringFromClass([v class]), f.origin.x, f.origin.y, f.size.width, f.size.height,
+        v.alpha, v.hidden];
+    for (UIView *sub in v.subviews) splash_adblock_dumpViewTree(sub, depth + 1, out);
+}
+
+static void splash_adblock_dumpWindows(void) {
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        NSMutableString *out = [NSMutableString stringWithFormat:
+            @"[tree] WINDOW level=%.0f root=%@ bounds=%@\n",
+            w.windowLevel, NSStringFromClass([w.rootViewController class]), NSStringFromCGRect(w.bounds)];
+        for (UIView *v in w.subviews) splash_adblock_dumpViewTree(v, 0, out);
+        splash_adblock_log(out);
+    }
+}
+
+// 兜底：把 window 上"类名含广告特征 + 接近全屏"的 view 透明化（保留回调链）。
+static void splash_adblock_fadeAdViewRecursive(UIView *v, UIWindow *win, BOOL isRoot) {
+    if (!v || isRoot) return;
+    NSString *cls = NSStringFromClass([v class]);
+    NSString *lower = [cls lowercaseString];
+    BOOL adName = NO;
+    NSArray *adKeys = @[@"splash", @"abu", @"csj", @"pangle", @"jgads", @"busplash",
+                        @"gdt", @"interstitial", @"splashad"];
+    for (NSString *k in adKeys) {
+        if ([lower rangeOfString:k].location != NSNotFound) { adName = YES; break; }
+    }
+    CGRect f = v.frame;
+    CGSize s = win.bounds.size;
+    BOOL fullscreen = s.width > 0 && f.size.width >= s.width * 0.8
+                      && f.size.height >= s.height * 0.5;
+    if (adName && fullscreen) {
+        splash_adblock_log([NSString stringWithFormat:@"[MATCH] smzdm ad view %@ frame=%@ -> fade",
+                            cls, NSStringFromCGRect(f)]);
+        splash_adblock_fadeTree(v);
+    }
+    BOOL childIsRoot = [v isEqual:win.rootViewController.view];
+    for (UIView *sub in v.subviews) splash_adblock_fadeAdViewRecursive(sub, win, childIsRoot);
+}
+
+static void splash_adblock_fadeFullscreenAdViews(void) {
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        for (UIView *v in w.subviews) {
+            splash_adblock_fadeAdViewRecursive(v, w, [v isEqual:w.rootViewController.view]);
+        }
+    }
+}
+
 // ---------- 评分弹窗检测（闪联） ----------
 static BOOL splash_adblock_textLooksLikeRating(NSString *s) {
     if (!s || s.length == 0) return NO;
@@ -301,18 +390,31 @@ static BOOL splash_adblock_viewLooksLikeRating(UIView *view, NSString **matchedT
         splash_adblock_writeLoadedMarker();
 
         // 2) 启动日志 + 每个写入路径的成败诊断
-        splash_adblock_log([NSString stringWithFormat:@"=== SplashAdBlock active v0.0.6 bundle=%@ ===", bundle]);
+        splash_adblock_log([NSString stringWithFormat:@"=== SplashAdBlock active v0.0.7 bundle=%@ ===", bundle]);
         for (NSString *p in splash_adblock_logPaths()) {
             BOOL ok = [[NSFileManager defaultManager] isWritableFileAtPath:[p stringByDeletingLastPathComponent]];
             splash_adblock_log([NSString stringWithFormat:@"[path] writable=%d %@", ok, p]);
         }
 
         if (splash_adblock_isSmzdm()) {
-            // 延迟 2s dump 广告 SDK 类名（等类注册完成）
+            // 延迟 2s dump 广告 SDK 类名 + 开屏类方法列表（等类注册完成）
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 splash_adblock_dumpSDKClasses();
+                splash_adblock_dumpSplashMethods();
             });
+
+            // 在开屏出现的几个关键时间点 dump 视图树 + 尝试兜底透明化广告 view
+            NSArray *ticks = @[@0.3, @0.8, @1.5, @3.0];
+            for (NSNumber *t in ticks) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(t.doubleValue * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    if (!splash_adblock_enabled() || !splash_adblock_isSmzdm()) return;
+                    splash_adblock_log([NSString stringWithFormat:@"[tree] === tick %.1fs ===", t.doubleValue]);
+                    splash_adblock_dumpWindows();
+                    splash_adblock_fadeFullscreenAdViews();
+                });
+            }
 
             // 兜底：监听高 level 独立 window 出现（启动 15s 内）
             [[NSNotificationCenter defaultCenter] addObserverForName:UIWindowDidBecomeVisibleNotification

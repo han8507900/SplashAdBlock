@@ -41,28 +41,60 @@ static BOOL splash_adblock_isSmzdm(void) {
 // 启动时间戳（用于把兜底限制在启动初期，避免误伤后续正常弹窗）
 static NSTimeInterval splash_adblock_launchTime = 0;
 
-// ---------- 轻量日志（按 bundle 末段分文件；无常驻轮询） ----------
-static NSString *splash_adblock_logPath(void) {
+// ---------- 轻量日志（多点冗余写入；无常驻轮询） ----------
+static NSString *splash_adblock_logTag(void) {
     NSString *bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"unknown";
     NSArray *parts = [bundle componentsSeparatedByString:@"."];
     NSString *tag = parts.lastObject ?: bundle;
     // 什么值得买末段是 "ios"，太通用，改用 smzdm 便于查找
     if ([bundle isEqualToString:@"com.smzdm.client.ios"]) tag = @"smzdm";
-    return [@"/var/mobile/Documents/" stringByAppendingPathComponent:
-            [NSString stringWithFormat:@"SplashAdBlock_%@.log", tag]];
+    return tag;
+}
+
+// 写日志到多个位置，任何一个成功即可找到。
+// 有的 App 沙盒严格，写不进 /var/mobile/Documents/，所以同时写 App 沙盒和 /tmp。
+static NSArray *splash_adblock_logPaths(void) {
+    NSString *name = [NSString stringWithFormat:@"SplashAdBlock_%@.log", splash_adblock_logTag()];
+    NSMutableArray *paths = [NSMutableArray array];
+    [paths addObject:[@"/var/mobile/Documents/" stringByAppendingPathComponent:name]];
+    [paths addObject:[@"/tmp/" stringByAppendingPathComponent:name]];
+    // App 自己的沙盒 Documents（一定可写）
+    NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    if (docs.firstObject) [paths addObject:[docs.firstObject stringByAppendingPathComponent:name]];
+    // App 沙盒 Library/Caches（一定可写）
+    NSArray *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
+    if (caches.firstObject) [paths addObject:[caches.firstObject stringByAppendingPathComponent:name]];
+    return paths;
 }
 
 static void splash_adblock_log(NSString *line) {
     NSData *data = [[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
-    NSString *path = splash_adblock_logPath();
-    NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:path];
-    if (h) {
-        [h seekToEndOfFile];
-        [h writeData:data];
-        [h closeFile];
-    } else {
-        [data writeToFile:path atomically:YES];
+    for (NSString *path in splash_adblock_logPaths()) {
+        @try {
+            NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:path];
+            if (h) {
+                [h seekToEndOfFile];
+                [h writeData:data];
+                [h closeFile];
+            } else {
+                [data writeToFile:path atomically:YES];
+            }
+        } @catch (NSException *e) {
+            // 某个路径写不进不影响其它路径
+        }
     }
+}
+
+// 在 /tmp 放一个一眼可见的"加载标记"，用于直接确认 dylib 是否真的被注入。
+// 打开文件就能确认插件进没进这个 App，不用再猜。
+static void splash_adblock_writeLoadedMarker(void) {
+    NSString *bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"unknown";
+    NSString *content = [NSString stringWithFormat:
+        @"SplashAdBlock LOADED\nbundle=%@\nversion=0.0.6\ntime=%.0f\n",
+        bundle, [[NSDate date] timeIntervalSince1970]];
+    NSString *marker = [NSString stringWithFormat:@"/tmp/SplashAdBlock_LOADED_%@",
+                        splash_adblock_logTag()];
+    [content writeToFile:marker atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
 // ---------- 透明化工具 ----------
@@ -264,7 +296,16 @@ static BOOL splash_adblock_viewLooksLikeRating(UIView *view, NSString **matchedT
         (void)splash_adblock_enabled();
         splash_adblock_launchTime = [[NSDate date] timeIntervalSince1970];
         NSString *bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"unknown";
-        splash_adblock_log([NSString stringWithFormat:@"=== SplashAdBlock active v0.0.5 bundle=%@ ===", bundle]);
+
+        // 1) 写一个一眼可见的加载标记到 /tmp
+        splash_adblock_writeLoadedMarker();
+
+        // 2) 启动日志 + 每个写入路径的成败诊断
+        splash_adblock_log([NSString stringWithFormat:@"=== SplashAdBlock active v0.0.6 bundle=%@ ===", bundle]);
+        for (NSString *p in splash_adblock_logPaths()) {
+            BOOL ok = [[NSFileManager defaultManager] isWritableFileAtPath:[p stringByDeletingLastPathComponent]];
+            splash_adblock_log([NSString stringWithFormat:@"[path] writable=%d %@", ok, p]);
+        }
 
         if (splash_adblock_isSmzdm()) {
             // 延迟 2s dump 广告 SDK 类名（等类注册完成）

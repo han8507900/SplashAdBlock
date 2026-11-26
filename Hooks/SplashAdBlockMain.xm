@@ -33,15 +33,15 @@ static NSString *splash_adblock_logPath(void) {
 }
 
 static void splash_adblock_log(NSString *line) {
-    NSString *text = [[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
+    NSData *data = [[line stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
     NSString *path = splash_adblock_logPath();
     NSFileHandle *h = [NSFileHandle fileHandleForWritingAtPath:path];
     if (h) {
         [h seekToEndOfFile];
-        [h writeData:text];
+        [h writeData:data];
         [h closeFile];
     } else {
-        [text writeToFile:path atomically:YES];
+        [data writeToFile:path atomically:YES];
     }
 }
 

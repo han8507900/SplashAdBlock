@@ -8,6 +8,7 @@
         <!-- 目标 App 列表：新增 App 时，把它的 Bundle ID 另起一行加进本数组 -->
         <array>
             <string>com.tencent.ied.app.lolbible</string>
+            <string>com.shanlian.pro</string>
         </array>
     </dict>
 </dict>

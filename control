@@ -1,6 +1,6 @@
 Package: com.hzy.splashadblock
 Name: 开屏广告屏蔽
-Version: 0.0.1
+Version: 0.0.2
 Architecture: iphoneos-arm64
 Description: 通用开屏广告屏蔽插件，一个插件支持多个 App，后续只需追加目标 App 即可。适用于 RootHide 隐根环境（relaxin / iOS 17.3.1）。
 Maintainer: hzy

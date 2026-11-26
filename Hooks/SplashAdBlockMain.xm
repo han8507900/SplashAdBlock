@@ -42,6 +42,22 @@ static BOOL splash_adblock_isSmzdm(void) {
 static NSTimeInterval splash_adblock_launchTime = 0;
 
 // ---------- 轻量日志（多点冗余写入；无常驻轮询） ----------
+#define SPLASH_ADBLOCK_VERSION @"0.0.8"
+
+// 本次会话的唯一标志（版本号 + 启动时间戳），整个进程内只生成一次，
+// 让每次装机/每次启动的日志文件名都不同，避免同名文件混淆。
+static NSString *splash_adblock_runStamp(void) {
+    static NSString *stamp = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+        [fmt setDateFormat:@"MMdd-HHmmss"];
+        NSString *ts = [fmt stringFromDate:[NSDate date]];
+        stamp = [NSString stringWithFormat:@"v%@_%@", SPLASH_ADBLOCK_VERSION, ts];
+    });
+    return stamp;
+}
+
 static NSString *splash_adblock_logTag(void) {
     NSString *bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"unknown";
     NSArray *parts = [bundle componentsSeparatedByString:@"."];
@@ -51,10 +67,16 @@ static NSString *splash_adblock_logTag(void) {
     return tag;
 }
 
+// 文件名带标志位：SplashAdBlock_<tag>_v<版本>_<时间戳>.log
+static NSString *splash_adblock_logName(void) {
+    return [NSString stringWithFormat:@"SplashAdBlock_%@_%@.log",
+            splash_adblock_logTag(), splash_adblock_runStamp()];
+}
+
 // 写日志到多个位置，任何一个成功即可找到。
 // 有的 App 沙盒严格，写不进 /var/mobile/Documents/，所以同时写 App 沙盒和 /tmp。
 static NSArray *splash_adblock_logPaths(void) {
-    NSString *name = [NSString stringWithFormat:@"SplashAdBlock_%@.log", splash_adblock_logTag()];
+    NSString *name = splash_adblock_logName();
     NSMutableArray *paths = [NSMutableArray array];
     [paths addObject:[@"/var/mobile/Documents/" stringByAppendingPathComponent:name]];
     [paths addObject:[@"/tmp/" stringByAppendingPathComponent:name]];
@@ -90,10 +112,10 @@ static void splash_adblock_log(NSString *line) {
 static void splash_adblock_writeLoadedMarker(void) {
     NSString *bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"unknown";
     NSString *content = [NSString stringWithFormat:
-        @"SplashAdBlock LOADED\nbundle=%@\nversion=0.0.6\ntime=%.0f\n",
-        bundle, [[NSDate date] timeIntervalSince1970]];
-    NSString *marker = [NSString stringWithFormat:@"/tmp/SplashAdBlock_LOADED_%@",
-                        splash_adblock_logTag()];
+        @"SplashAdBlock LOADED\nbundle=%@\nversion=%@\ntime=%.0f\n",
+        bundle, SPLASH_ADBLOCK_VERSION, [[NSDate date] timeIntervalSince1970]];
+    NSString *marker = [NSString stringWithFormat:@"/tmp/SplashAdBlock_LOADED_%@_%@",
+                        splash_adblock_logTag(), splash_adblock_runStamp()];
     [content writeToFile:marker atomically:YES encoding:NSUTF8StringEncoding error:nil];
 }
 
@@ -236,7 +258,7 @@ static void splash_adblock_fadeAdViewRecursive(UIView *v, UIWindow *win, BOOL is
     NSString *lower = [cls lowercaseString];
     BOOL adName = NO;
     NSArray *adKeys = @[@"splash", @"abu", @"csj", @"pangle", @"jgads", @"busplash",
-                        @"gdt", @"interstitial", @"splashad"];
+                        @"gdt", @"interstitial", @"splashad", @"smfullwindowad", @"smad"];
     for (NSString *k in adKeys) {
         if ([lower rangeOfString:k].location != NSNotFound) { adName = YES; break; }
     }
@@ -305,6 +327,30 @@ static BOOL splash_adblock_viewLooksLikeRating(UIView *view, NSString **matchedT
     if (!splash_adblock_enabled() || !splash_adblock_isLolbible()) return;
     splash_adblock_log(@"[hook] TGGDTSplashViewManager showAllSubView");
     [self hiddenAllSubView];
+}
+%end
+
+#pragma mark - 什么值得买开屏容器（精准 hook，仅 smzdm 生效）
+
+// SMFullWindowAdView 是真机上确认的全屏广告容器。
+// 在它出现的各时机把整棵树 alpha=0（不 hidden、不移除、不碰广告 SDK 的计时/回调），
+// 保留完整展示流程 -> 不卡启动、不被判"展示失败"重弹。
+%hook SMFullWindowAdView
+- (void)didMoveToWindow {
+    %orig;
+    if (!splash_adblock_enabled() || !splash_adblock_isSmzdm()) return;
+    splash_adblock_log(@"[hook] SMFullWindowAdView didMoveToWindow -> fade");
+    splash_adblock_fadeTree(self);
+}
+- (void)layoutSubviews {
+    %orig;
+    if (!splash_adblock_enabled() || !splash_adblock_isSmzdm()) return;
+    splash_adblock_fadeTree(self);
+}
+- (void)setHidden:(BOOL)hidden {
+    %orig;
+    if (!splash_adblock_enabled() || !splash_adblock_isSmzdm()) return;
+    if (!hidden) splash_adblock_fadeTree(self);
 }
 %end
 
@@ -390,7 +436,8 @@ static BOOL splash_adblock_viewLooksLikeRating(UIView *view, NSString **matchedT
         splash_adblock_writeLoadedMarker();
 
         // 2) 启动日志 + 每个写入路径的成败诊断
-        splash_adblock_log([NSString stringWithFormat:@"=== SplashAdBlock active v0.0.7 bundle=%@ ===", bundle]);
+        splash_adblock_log([NSString stringWithFormat:@"=== SplashAdBlock active v%@ bundle=%@ stamp=%@ ===",
+                            SPLASH_ADBLOCK_VERSION, bundle, splash_adblock_runStamp()]);
         for (NSString *p in splash_adblock_logPaths()) {
             BOOL ok = [[NSFileManager defaultManager] isWritableFileAtPath:[p stringByDeletingLastPathComponent]];
             splash_adblock_log([NSString stringWithFormat:@"[path] writable=%d %@", ok, p]);

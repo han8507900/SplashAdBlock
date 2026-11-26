@@ -4,19 +4,18 @@
 #import "SplashAdBlockPrivate.h"
 
 // ============================================================================
-// 通用开屏广告屏蔽插件 —— 正式屏蔽版
+// 通用开屏广告屏蔽插件 —— 秒跳过版（v0.0.2）
 //
-// 一个 dylib 通过 plist 的 Bundles 注入多个目标 App，按 Bundle ID 分流策略。
-// 核心原则：在广告"数据源层/展示入口"拦截，让广告根本不加载、不显示，
-//           不做事后 hidden 视图（会闪）、不做高频轮询（耗电）。
+// 重要教训（v0.0.1 卡启动页）：
+//   上一版直接 hook show/load 让广告"根本不加载"，但 App 是靠广告结束后的
+//   dismiss / completion 回调才进入主界面的。把 show 截断 = 回调永不触发
+//   = 卡在启动页。
+//
+// 本版策略：不阻断任何展示与加载方法，保留完整回调链，只把广告停留时长
+//   fetchDelay 压到极短（0.05 秒）。广告几乎不可见，但 App 启动流程照常。
 //
 // 已适配 App（依据真机探针日志）：
-//   · 掌盟 com.tencent.ied.app.lolbible
-//     广点通 GDT 开屏链：TGGDTSplashViewController -> TGGDTSplashWindowView
-//                        -> GDTSplashAd(showSplashWithOrder:...)
-//     广告在独立 UIWindow(level=1001) 上全屏展示。
-//
-// 后续新增 App：只需在 plist 追加 Bundle ID，并在下方 hook 区加对应类。
+//   · 掌盟 com.tencent.ied.app.lolbible —— 广点通 GDT 开屏
 // ============================================================================
 
 static BOOL splash_adblock_enabled(void) {
@@ -46,64 +45,28 @@ static void splash_adblock_log(NSString *line) {
 }
 
 // ===========================================================================
-// 掌盟 / 广点通 GDT 开屏
+// 掌盟 / 广点通 GDT 开屏 —— 秒跳过
 //
-// 拦截点来自真机探针日志，不是猜测：
-//  1) GDTSplashAd showSplashWithOrder:... —— 广点通把开屏显示出来的入口，
-//     拦掉后广告不加载/不显示，最干净，无闪现、无轮询。
-//  2) TGGDTSplashViewController / TGGDTSplashWindowView 的
-//     splashViewShowWithModel:... —— 掌盟封装层展示入口，双保险。
-//  3) TGGDTSplashViewManager showAllSubView —— 再兜一层，防止走别的 show 路径。
+// 日志确认 GDTSplashAd 有 fetchDelay / setFetchDelay:，这是广点通开屏的
+// 停留时长。getter 和 setter 都压到 0.05 秒后，SDK 仍会正常走完
+// "展示→结束→回调"全过程，App 收到结束回调后正常进主界面，不会卡启动页。
 //
-// 注意：不碰 viewDidAppear/生命周期，App 启动流程照常走，不会卡启动页。
+// 关键：绝不再拦截 showSplashWithOrder / loadAdAndShowSplash 等方法。
 // ===========================================================================
+
+static double const splash_adblock_short_delay = 0.05;
 
 %hook GDTSplashAd
 
-- (void)showSplashWithOrder:(id)arg1 withCustomUI:(id)arg2 {
-    if (!splash_adblock_enabled()) { %orig; return; }
-    splash_adblock_log(@"[blocked] GDTSplashAd showSplashWithOrder:withCustomUI:");
+- (double)fetchDelay {
+    if (!splash_adblock_enabled()) return %orig;
+    splash_adblock_log(@"[fast-skip] GDTSplashAd fetchDelay -> 0.05");
+    return splash_adblock_short_delay;
 }
 
-- (void)showSplashWithOrder:(id)arg1 withCustomUI:(id)arg2 inContainerView:(id)arg3 {
+- (void)setFetchDelay:(double)arg1 {
     if (!splash_adblock_enabled()) { %orig; return; }
-    splash_adblock_log(@"[blocked] GDTSplashAd showSplashWithOrder:withCustomUI:inContainerView:");
-}
-
-// 预加载订单也拦掉，减少广告请求与流量
-- (void)preLoadSplashOrder:(id)arg1 {
-    if (!splash_adblock_enabled()) { %orig; return; }
-}
-
-- (void)loadAdAndShowSplashWithCustomUIModel:(id)arg1 {
-    if (!splash_adblock_enabled()) { %orig; return; }
-    splash_adblock_log(@"[blocked] GDTSplashAd loadAdAndShowSplashWithCustomUIModel:");
-}
-
-%end
-
-%hook TGGDTSplashViewController
-
-- (void)splashViewShowWithModel:(id)arg1 animBegin:(id)arg2 animEnd:(id)arg3 cacheWebView:(id)arg4 {
-    if (!splash_adblock_enabled()) { %orig; return; }
-    splash_adblock_log(@"[blocked] TGGDTSplashViewController splashViewShowWithModel");
-}
-
-%end
-
-%hook TGGDTSplashWindowView
-
-- (void)splashViewShowWithModel:(id)arg1 animBegin:(id)arg2 animEnd:(id)arg3 cacheWebView:(id)arg4 {
-    if (!splash_adblock_enabled()) { %orig; return; }
-    splash_adblock_log(@"[blocked] TGGDTSplashWindowView splashViewShowWithModel");
-}
-
-%end
-
-%hook TGGDTSplashViewManager
-
-- (void)showAllSubView {
-    if (!splash_adblock_enabled()) { %orig; return; }
+    %orig(splash_adblock_short_delay);
 }
 
 %end
@@ -112,6 +75,6 @@ static void splash_adblock_log(NSString *line) {
     @autoreleasepool {
         (void)splash_adblock_enabled();
         NSString *bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"unknown";
-        splash_adblock_log([NSString stringWithFormat:@"=== SplashAdBlock active (block mode) bundle=%@ ===", bundle]);
+        splash_adblock_log([NSString stringWithFormat:@"=== SplashAdBlock active (fast-skip v0.0.2) bundle=%@ ===", bundle]);
     }
 }

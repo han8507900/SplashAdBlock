@@ -23,6 +23,11 @@
 @interface TGGDTSplashWindowView : UIView
 @end
 
+// -------- 什么值得买开屏容器（真机视图树确认）--------
+// SMFullWindowAdView 全屏盖在主 window 上(393x852)，是广告的最终容器。
+@interface SMFullWindowAdView : UIView
+@end
+
 // -------- 评分弹窗 --------
 // 系统原生评分控制器（iOS 10.3+）。前向声明避免依赖 StoreKit 框架。
 @interface SKStoreReviewController : NSObject

@@ -4,7 +4,7 @@
 #import "SplashAdBlockPrivate.h"
 
 // ============================================================================
-// 通用屏蔽插件（v0.1.3）
+// 通用屏蔽插件（v0.1.4）
 //
 // 已精准适配：
 //  · 掌盟 com.tencent.ied.app.lolbible —— 广点通 GDT 开屏（透明化）
@@ -12,16 +12,13 @@
 //  · 什么值得买 com.smzdm.client.ios   —— SMFullWindowAdView 开屏（精准透明化）
 //  · 直播吧 com.zhibo8.tenyears        —— ZBSplashView 开屏（精准透明化，v0.1.1）
 //
-// v0.1.3 相对 v0.1.2 的变化（消除直播吧开屏黑屏）：
-//  背景：v0.1.2 [SIG] 探针确认 ZBSplashAdViewController 有 App 自带的
-//        displayRootViewController（无参 void），且生命周期日志显示开屏 VC
-//        viewDidAppear ~1.5s、viewWillDisappear ~7.9s、主界面 ~12s 才挂上，
-//        中间黑底是 App 串行等待期。
-//  · 在 viewDidAppear 后延迟 ~0.5s 主动调用一次 displayRootViewController，
-//    让主界面提前挂上盖住黑底；dispatch_once 只调一次，%orig 全保留，
-//    不掐断广告加载/计时/回调链（不做 v0.0.1 那种危险操作）。
-//  · respondsToSelector + @try/catch 双保护，方法不存在或异常都不影响原流程。
-//  · v0.1.2 的探针（签名 dump、生命周期 log、root tick）全部保留，便于验证效果。
+// v0.1.4 相对 v0.1.3 的变化（把直播吧开屏黑屏压到视觉 0）：
+//  背景：v0.1.3 日志证明提前调用 displayRootViewController 安全有效——
+//        主界面从 ~12s 提前到 ~1.5s 挂上，且 App 自己 8.05s 仍正常再调一次，
+//        开屏 VC 回调链完整、无卡启动。剩余 ~0.5s 黑屏来自主动调用的 0.5s 延迟。
+//  · 把该延迟从 0.5s 降到 0.02s（下一 runloop），黑屏窗口压到一帧内，视觉为 0。
+//  · dispatch_once 只调一次、respondsToSelector + @try/catch 保护、%orig 全保留
+//    等安全措施不变；v0.1.2 探针全保留便于验证。
 //  全程无常驻轮询；日志单路径 + 自动清理；包名不变。
 // ============================================================================
 
@@ -50,7 +47,7 @@ static BOOL splash_adblock_isZhibo8(void) {
 }
 
 // ---------- 轻量日志（单路径 + 自动清理，无常驻监听、无轮询） ----------
-#define SPLASH_ADBLOCK_VERSION @"0.1.3"
+#define SPLASH_ADBLOCK_VERSION @"0.1.4"
 
 // 本次会话的唯一标志（版本号 + 启动时间戳），进程内只生成一次。
 // 日志文件名继续带标志位，沿用既有约定，便于确认是哪一版、哪一次启动。
@@ -534,13 +531,13 @@ static inline double splash_adblock_zhiboElapsed(void) {
     if (splash_adblock_enabled() && splash_adblock_isZhibo8()) {
         splash_adblock_log([NSString stringWithFormat:@"[zhibo][life] SplashVC viewDidAppear t=%.2f",
                             splash_adblock_zhiboElapsed()]);
-        // v0.1.3：开屏已 fade，提前触发 App 自带的 displayRootViewController，
-        // 让主界面提前挂上盖住黑底。进程内只主动调用一次；%orig 全保留，
-        // 不掐断广告加载/计时/回调链。
+        // v0.1.4：开屏已 fade，立即触发 App 自带的 displayRootViewController，
+        // 让主界面在下一 runloop 就挂上（延迟 0.02s，视觉 0 黑屏）。
+        // 进程内只主动调用一次；%orig 全保留，不掐断广告加载/计时/回调链。
         static dispatch_once_t earlyDisplayToken;
         dispatch_once(&earlyDisplayToken, ^{
             __weak ZBSplashAdViewController *weakSelf = self;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.02 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 ZBSplashAdViewController *strongSelf = weakSelf;
                 if (!strongSelf) return;

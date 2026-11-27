@@ -4,7 +4,7 @@
 #import "SplashAdBlockPrivate.h"
 
 // ============================================================================
-// 通用屏蔽插件（v0.3.5）
+// 通用屏蔽插件（v0.4.0）
 //
 // 已精准适配（屏蔽逻辑一行未改）：
 //  · 掌盟 com.tencent.ied.app.lolbible —— 广点通 GDT 开屏（透明化）
@@ -18,13 +18,18 @@
 //                                        （竞品逆向，已真机验证定版）
 //  · 铁路12306 cn.12306.rails12306     —— 吞两个数据注入 setter（竞品逆向，已定版）
 //  · 下厨房 com.xiachufang.recipe      —— 揭启动占位窗口 + 倍孜广告 VC 透明 + 启动期
-//                                        拦 openURL 防摇一摇跳转（v0.3.4 真机验证定版）
+//                                        拦 openURL 防摇一摇跳转（v0.3.4 验证、v0.3.5 定版）
+//  · 威锋   com.feng.New.WPForumClient —— ADJgSDK 开屏入口吞掉（竞品同款）
+//                                        + 启动期 openURL shield 防摇一摇跳转
 //
-// v0.3.5（定版收尾版，无功能改动）：
-//  · 用户真机确认 v0.3.4 下厨房"可以了" → 按约定移出诊断日志白名单。
-//  · 日志开关改为全局 NO：所有 App 每次启动不再生成任何日志文件；启动时
-//    pruneOldLogs 会删除本插件残留的全部 .log（含诊断期留下的
-//    SplashAdBlock_xiachufang.log），手机上不留垃圾。屏蔽逻辑一行未改。
+// v0.4.0 新增威锋（用户反馈"打开以后会有摇一摇跳转广告"）：
+//  · 竞品「威锋去广告.dylib」构造函数反汇编确认：它 hook 了 ADJgSDK 三个类四个方法，
+//    其中开屏是 ADJgSDKSplashAd -loadAndShowInWindow:，replacement 只有一条 ret。
+//  · 本版照此只做开屏这一条：不调 orig = 本次不展示开屏 → 广告 view 与摇一摇传感器
+//    都不会武装。信息流的 ADJgSDKNativeAd 三个点先不动（一次只解决一个问题）。
+//  · 另加兜底：启动期 15s 内拦 UIApplication openURL（放行 file:// 与威锋自身 scheme），
+//    万一还有别的 SDK 的摇一摇/自动跳转也甩不走用户；同时 3 次一次性检查，
+//    若存在「level>100 且 root 类名含 Launch/Splash」的启动占位窗口且主界面已就绪，则揭掉。
 //
 // v0.3.4 下厨房修正（v0.3.3 真机反馈：启动屏变长 + 仍有广告）：
 //  · 教训：v0.3.3 吞 BeiZi_loadSplashAd 后 SDK 不再回调，下厨房的
@@ -89,16 +94,21 @@ static BOOL splash_adblock_isXiachufang(void) {
     return [b isEqualToString:@"com.xiachufang.recipe"];
 }
 
-// ---------- 轻量日志（按需开关，无常驻监听、无轮询） ----------
-#define SPLASH_ADBLOCK_VERSION @"0.3.5"
+static BOOL splash_adblock_isWPForum(void) {
+    NSString *b = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+    return [b isEqualToString:@"com.feng.New.WPForumClient"];
+}
 
-// 日志默认关闭：所有 App 均已定版，每次启动不再生成任何日志文件。
-// 接入新 App 做诊断时，这里临时 `return [bundle isEqualToString:@"<新 bundle>"];`，
-// 真机验证通过后**下一版必须改回 NO**（用户要求：定版 App 一律不写日志）。
+// ---------- 轻量日志（按需开关，无常驻监听、无轮询） ----------
+#define SPLASH_ADBLOCK_VERSION @"0.4.0"
+
+// 日志默认关闭：已定版 App 每次启动不再生成任何日志文件。
+// 接入新 App 做诊断时，这里临时指向它的 bundle，真机验证通过后**下一版必须改回 NO**。
 // 变更记录：百度地图 v0.3.0 诊断→v0.3.1 定版；12306 v0.3.1 诊断→v0.3.2 定版；
-//          下厨房 v0.3.2~v0.3.4 诊断→v0.3.5 定版，白名单清空。
+//          下厨房 v0.3.2~v0.3.4 诊断→v0.3.5 定版；威锋 v0.4.0 诊断中。
 static BOOL splash_adblock_logEnabled(void) {
-    return NO;
+    NSString *bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+    return [bundle isEqualToString:@"com.feng.New.WPForumClient"];
 }
 
 // 本次会话的唯一标志（版本号 + 启动时间戳），进程内只生成一次。
@@ -124,6 +134,7 @@ static NSString *splash_adblock_logTag(void) {
     if ([bundle isEqualToString:@"com.zhibo8.tenyears"]) tag = @"zhibo8";
     if ([bundle isEqualToString:@"cn.12306.rails12306"]) tag = @"12306";
     if ([bundle isEqualToString:@"com.xiachufang.recipe"]) tag = @"xiachufang";
+    if ([bundle isEqualToString:@"com.feng.New.WPForumClient"]) tag = @"weiphone";
     return tag;
 }
 
@@ -553,20 +564,144 @@ static void splash_adblock_xcfInstallPlaceholderHook(void) {
 }
 %end
 
-// 摇一摇跳转拦截：只在 shield 窗口内、只拦"离开本 App"的 URL。
-// 放行 file:// 与下厨房自身 scheme，避免影响 App 内部跳转。
+#pragma mark - 威锋开屏（ADJgSDK，仅 com.feng.New.WPForumClient 生效）
+
+// 依据：竞品「威锋去广告.dylib」构造函数反汇编（本仓库
+// _competitor_extract/Library/MobileSubstrate/DynamicLibraries/威锋去广告.dylib）：
+//   objc_getClass("ADJgSDKSplashAd") + MSHookMessageEx(@selector(loadAndShowInWindow:),
+//   replacement) —— replacement 只有一条 ret，即"完全不展示开屏"。
+// 用户反馈的现象是"打开后摇一摇跳转广告"，摇一摇由 ADJgSDK 在开屏生命周期内驱动；
+// 不展示开屏 = 广告 view 与传感器都不会武装。这是竞品实测有效的成熟做法。
+// 另加一道兜底：启动期 15s 内拦 openURL，防止其它 SDK 的摇一摇/自动跳转把用户甩走。
+// 门控：仅启用开关 + 该 bundle；其它 App 完全 %orig，行为一行不变。
+
+// ---- 启动期 openURL 防护 ----
+static NSTimeInterval splash_adblock_wpShieldUntil = 0;
+
+static BOOL splash_adblock_wpShouldBlockURL(NSURL *url) {
+    if (!splash_adblock_enabled() || !splash_adblock_isWPForum()) return NO;
+    if (splash_adblock_wpShieldUntil <= 0) return NO;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (now > splash_adblock_wpShieldUntil) return NO;
+    NSString *scheme = url.scheme.lowercaseString ?: @"";
+    if (scheme.length == 0) return NO;
+    if ([scheme isEqualToString:@"file"]) return NO;
+    if ([scheme containsString:@"feng"]) return NO;
+    if ([scheme containsString:@"weiphone"]) return NO;
+    if ([scheme containsString:@"wpforum"]) return NO;
+    return YES;
+}
+
+// ---- 兜底：启动占位窗口在主界面就绪后揭掉（不依赖具体类名） ----
+// 只处理「level>100 且 root VC 类名含 Launch/Splash」的窗口，且必须已有可见的
+// TabBar 主界面窗口才动手，避免误伤首启引导页/登录页。
+static void splash_adblock_wpRevealLaunchWindow(void) {
+    if (!splash_adblock_enabled() || !splash_adblock_isWPForum()) return;
+    UIWindow *mainW = nil;
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        if (w.isHidden || w.alpha <= 0.01) continue;
+        if (w.windowLevel > 100) continue;
+        NSString *n = NSStringFromClass([w.rootViewController class]) ?: @"";
+        if ([n rangeOfString:@"tabbar" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+            mainW = w;
+            break;
+        }
+    }
+    if (!mainW) return;
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        if (w == mainW || w.isHidden || w.alpha <= 0.01) continue;
+        NSString *n = NSStringFromClass([w.rootViewController class]) ?: @"";
+        BOOL launchLike = ([n rangeOfString:@"launch" options:NSCaseInsensitiveSearch].location != NSNotFound)
+                       || ([n rangeOfString:@"splash" options:NSCaseInsensitiveSearch].location != NSNotFound);
+        if (!launchLike) continue;
+        splash_adblock_fadeTree(w);
+        w.alpha = 0.0;
+        w.userInteractionEnabled = NO;
+        splash_adblock_log([NSString stringWithFormat:@"[wp][hook] reveal launch window root=%@ -> alpha=0", n]);
+    }
+}
+
+// 诊断用：启动期只打一次窗口清单（最多 6 条），不做视图树 dump。
+static void splash_adblock_wpDumpWindows(void) {
+    if (!splash_adblock_enabled() || !splash_adblock_isWPForum()) return;
+    NSInteger n = 0;
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        if (n >= 6) break;
+        n++;
+        splash_adblock_log([NSString stringWithFormat:@"[wp][win] level=%.0f alpha=%.2f root=%@",
+                            w.windowLevel, w.alpha, NSStringFromClass([w.rootViewController class])]);
+    }
+}
+
+static void splash_adblock_wpStartProtection(void) {
+    if (!splash_adblock_enabled() || !splash_adblock_isWPForum()) return;
+    splash_adblock_wpShieldUntil = [[NSDate date] timeIntervalSince1970] + 15.0;
+    splash_adblock_log(@"[wp] protection active: ADJgSDK splash off + openURL shield 15s");
+    // 4 次一次性兜底（无定时器、无观察者）：揭启动占位 + 打一次窗口清单
+    NSArray *ticks = @[@1.2, @2.5, @4.0];
+    for (NSNumber *t in ticks) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(t.doubleValue * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            splash_adblock_wpRevealLaunchWindow();
+        });
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        splash_adblock_wpDumpWindows();
+    });
+}
+
+// 开屏入口：不调 orig = 本次不加载/不展示开屏（竞品 replacement 为 ret 的同款做法）。
+// 用 runtime 安装（而非 %hook）：类名不存在时 %hook 会拿到 NULL class，
+// 这里手工检查并把"类/方法是否存在"写进日志，定位更快也更安全。
+static void (*splash_adblock_wpOrigLoadAndShow)(id, SEL, id) = NULL;
+
+static void splash_adblock_wpLoadAndShow(id self, SEL _cmd, id window) {
+    if (!splash_adblock_enabled() || !splash_adblock_isWPForum()) {
+        if (splash_adblock_wpOrigLoadAndShow) splash_adblock_wpOrigLoadAndShow(self, _cmd, window);
+        return;
+    }
+    static dispatch_once_t logOnce;
+    dispatch_once(&logOnce, ^{
+        splash_adblock_log(@"[wp][hook] ADJgSDKSplashAd loadAndShowInWindow: -> swallow (no splash, no shake)");
+    });
+}
+
+static void splash_adblock_wpInstallSplashHook(void) {
+    if (!splash_adblock_enabled() || !splash_adblock_isWPForum()) return;
+    Class cls = NSClassFromString(@"ADJgSDKSplashAd");
+    if (!cls) {
+        splash_adblock_log(@"[wp][hook] class ADJgSDKSplashAd NOT found (splash may use another SDK)");
+        return;
+    }
+    SEL sel = NSSelectorFromString(@"loadAndShowInWindow:");
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) {
+        splash_adblock_log(@"[wp][hook] ADJgSDKSplashAd has no loadAndShowInWindow:");
+        return;
+    }
+    if (!splash_adblock_wpOrigLoadAndShow) {
+        *(void **)(&splash_adblock_wpOrigLoadAndShow) = (void *)method_getImplementation(m);
+        method_setImplementation(m, (IMP)splash_adblock_wpLoadAndShow);
+        splash_adblock_log(@"[wp][hook] ADJgSDKSplashAd loadAndShowInWindow: hooked");
+    }
+}
+
+// 摇一摇跳转拦截（下厨房 + 威锋共用一个拦截器）：
+// 只在各自的 shield 窗口内、只拦"离开本 App"的 URL；
+// 放行 file:// 与各自 App 的自身 scheme，避免影响 App 内部跳转。
 %hook UIApplication
 - (BOOL)openURL:(NSURL *)url {
-    if (splash_adblock_xcfShouldBlockURL(url)) {
-        splash_adblock_log([NSString stringWithFormat:@"[xcf][shield] block openURL:%@", url.absoluteString]);
+    if (splash_adblock_xcfShouldBlockURL(url) || splash_adblock_wpShouldBlockURL(url)) {
+        splash_adblock_log([NSString stringWithFormat:@"[shield] block openURL:%@", url.absoluteString]);
         return NO;
     }
     return %orig;
 }
 - (void)openURL:(NSURL *)url options:(NSDictionary<NSString *, id> *)options
         completionHandler:(void (^)(BOOL success))completion {
-    if (splash_adblock_xcfShouldBlockURL(url)) {
-        splash_adblock_log([NSString stringWithFormat:@"[xcf][shield] block openURL:%@ options", url.absoluteString]);
+    if (splash_adblock_xcfShouldBlockURL(url) || splash_adblock_wpShouldBlockURL(url)) {
+        splash_adblock_log([NSString stringWithFormat:@"[shield] block openURL:%@ options", url.absoluteString]);
         if (completion) completion(NO);
         return;
     }
@@ -1000,9 +1135,11 @@ static inline double splash_adblock_zhiboElapsed(void) {
         splash_adblock_pruneOldLogs();
 
         // 直播吧：启动弹窗探针；下厨房：安装启动占位 VC 的 runtime hook（主界面就绪即揭掉
-        // 占位窗口）；微博：提前进主界面由广告 VC viewDidAppear 事件驱动。
-        // 其余 App 内部门控直接返回。
+        // 占位窗口）；威锋：武装启动期 openURL shield + 揭启动占位兜底；
+        // 微博：提前进主界面由广告 VC viewDidAppear 事件驱动。其余 App 内部门控直接返回。
         splash_adblock_zhiboStartProbe();
         splash_adblock_xcfInstallPlaceholderHook();
+        splash_adblock_wpStartProtection();
+        splash_adblock_wpInstallSplashHook();
     }
 }

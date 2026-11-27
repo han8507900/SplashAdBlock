@@ -65,6 +65,13 @@
 - (void)viewDidLoad;
 @end
 
+// -------- 百度地图开屏（竞品「广告终结者」逆向确认）--------
+// BMSplashMaterialManager 的 -isSplashShowClosed 决定开屏是否展示；
+// 返回 YES 让百度走"开屏已展示过"的无开屏路径直接进主界面。
+@interface BMSplashMaterialManager : NSObject
+- (BOOL)isSplashShowClosed;
+@end
+
 // -------- 评分弹窗 --------
 // 系统原生评分控制器（iOS 10.3+）。前向声明避免依赖 StoreKit 框架。
 @interface SKStoreReviewController : NSObject

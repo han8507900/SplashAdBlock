@@ -1,6 +1,6 @@
 Package: com.hzy.splashadblock
 Name: 广告弹窗屏蔽
-Version: 0.4.2
+Version: 0.4.3
 Architecture: iphoneos-arm64
 Description: 通用屏蔽插件，一个插件支持多个 App：掌盟开屏广告、闪联评分弹窗、什么值得买开屏广告、直播吧开屏广告、微博开屏广告、百度地图开屏广告、铁路12306开屏广告、下厨房开屏广告、威锋开屏广告（优量汇 GDT）。后续只需追加目标 App 即可。适用于 RootHide 隐根环境（relaxin / iOS 17.3.1）。
 Maintainer: hzy

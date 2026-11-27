@@ -1432,7 +1432,11 @@ static void splash_adblock_wpInstallSplashHook(void) {
     UIView *rootView = w.rootViewController.view;
     // 主界面所在的容器链（UITransitionView 等）绝不动 —— v0.4.6 全黑就是压了它
     if (rootView && splash_adblock_wpIsAncestorOfRoot(subview, rootView)) return;
-    if (!rootView && w == splash_adblock_wpMainWindow()) return;   // 主界面未就绪先不动
+    BOOL mainWin = (w == splash_adblock_wpMainWindow());
+    if (!rootView && mainWin) return;                      // 主界面未就绪先不动
+    // 主窗口的内容容器（UIKit 用 UITransitionView 包着整棵主界面）：即使此刻 rootView
+    // 还没进层级、祖先关系判不出来，也按类名兜一层 —— 这是 v0.4.6 全黑的成因。
+    if (mainWin && [NSStringFromClass([subview class]) isEqualToString:@"UITransitionView"]) return;
     BOOL adish = splash_adblock_wpViewLooksLikeAdView(subview)
               || splash_adblock_wpTreeHasAdView(subview, 0);
     // "广告上下文"：本窗口里已经出现广告类视图时才按全屏尺寸兜底，

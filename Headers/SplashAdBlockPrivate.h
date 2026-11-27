@@ -45,6 +45,15 @@
 - (void)displayRootViewController;
 @end
 
+// -------- 微博开屏容器（真机 v0.1.6 日志确认）--------
+// WBAdSdkFlashAdView 全屏 393x852，位于 level=2100 的 WBAdSdkNewRootViewController window 内，
+// 素材子视图 WBAdSdkImageContentView / WBAdXSplashComponentView / WBMPSinglePageView。
+@interface WBAdSdkFlashAdView : UIView
+- (void)didMoveToWindow;
+- (void)layoutSubviews;
+- (void)setHidden:(BOOL)hidden;
+@end
+
 // -------- 评分弹窗 --------
 // 系统原生评分控制器（iOS 10.3+）。前向声明避免依赖 StoreKit 框架。
 @interface SKStoreReviewController : NSObject

@@ -4,22 +4,25 @@
 #import "SplashAdBlockPrivate.h"
 
 // ============================================================================
-// 通用屏蔽插件（v0.1.4）
+// 通用屏蔽插件（v0.1.5）
 //
-// 已精准适配：
+// 已精准适配（屏蔽逻辑相对 v0.1.4 一行未改）：
 //  · 掌盟 com.tencent.ied.app.lolbible —— 广点通 GDT 开屏（透明化）
 //  · 闪联 com.shanlian.pro             —— 评分弹窗
 //  · 什么值得买 com.smzdm.client.ios   —— SMFullWindowAdView 开屏（精准透明化）
-//  · 直播吧 com.zhibo8.tenyears        —— ZBSplashView 开屏（精准透明化，v0.1.1）
+//  · 直播吧 com.zhibo8.tenyears        —— ZBSplashView 开屏（精准透明化）
+//                                        + 提前 displayRootViewController 消黑屏
 //
-// v0.1.4 相对 v0.1.3 的变化（把直播吧开屏黑屏压到视觉 0）：
-//  背景：v0.1.3 日志证明提前调用 displayRootViewController 安全有效——
-//        主界面从 ~12s 提前到 ~1.5s 挂上，且 App 自己 8.05s 仍正常再调一次，
-//        开屏 VC 回调链完整、无卡启动。剩余 ~0.5s 黑屏来自主动调用的 0.5s 延迟。
-//  · 把该延迟从 0.5s 降到 0.02s（下一 runloop），黑屏窗口压到一帧内，视觉为 0。
-//  · dispatch_once 只调一次、respondsToSelector + @try/catch 保护、%orig 全保留
-//    等安全措施不变；v0.1.2 探针全保留便于验证。
-//  全程无常驻轮询；日志单路径 + 自动清理；包名不变。
+// v0.1.5 相对 v0.1.4 的变化（纯清理，屏蔽行为零改动）：
+//  背景：直播吧开屏已在 v0.1.1 精准 hook、黑屏已在 v0.1.3/0.1.4 解决，
+//        但 v0.1.0~v0.1.2 的诊断探针仍然每次启动照跑照写（类名/方法/签名 dump、
+//        8 次窗口树快照、生命周期日志、逐个 VC 日志），属无用开销。
+//  · 移除：zhiboDumpClasses / zhiboDumpMethods / zhiboDumpTargetSignatures /
+//    zhiboDumpWindows、8 次窗口树 tick、root VC 记录、开屏 VC 生命周期日志、
+//    逐 VC 常规日志。窗口树底层工具函数保留（弹窗探针仍用它 dump 命中弹窗）。
+//  · 保留：弹窗探针（present VC + 新 window 观察，各限次、120s 自动失效）、
+//    3 次轻量兜底 tick（只在命中时写日志）、全部精准 hook 与黑屏修复。
+//  全程无常驻轮询；日志单路径 + 自动清理（每目录留最近 2 份）；包名不变。
 // ============================================================================
 
 static BOOL splash_adblock_enabled(void) {
@@ -47,7 +50,7 @@ static BOOL splash_adblock_isZhibo8(void) {
 }
 
 // ---------- 轻量日志（单路径 + 自动清理，无常驻监听、无轮询） ----------
-#define SPLASH_ADBLOCK_VERSION @"0.1.4"
+#define SPLASH_ADBLOCK_VERSION @"0.1.5"
 
 // 本次会话的唯一标志（版本号 + 启动时间戳），进程内只生成一次。
 // 日志文件名继续带标志位，沿用既有约定，便于确认是哪一版、哪一次启动。
@@ -238,119 +241,6 @@ static void splash_adblock_zhiboDumpTree(UIView *v, NSInteger depth, NSMutableSt
     for (UIView *sub in v.subviews) splash_adblock_zhiboDumpTree(sub, depth + 1, out, lines);
 }
 
-static void splash_adblock_zhiboDumpWindows(NSString *when) {
-    NSInteger lines = 0;
-    for (UIWindow *w in [UIApplication sharedApplication].windows) {
-        NSMutableString *out = [NSMutableString stringWithFormat:
-            @"[zhibo][tree@%@] WINDOW level=%.0f root=%@ bounds=%@\n",
-            when, w.windowLevel, NSStringFromClass([w.rootViewController class]), NSStringFromCGRect(w.bounds)];
-        lines++;
-        for (UIView *v in w.subviews) splash_adblock_zhiboDumpTree(v, 0, out, &lines);
-        splash_adblock_log(out);
-    }
-}
-
-static void splash_adblock_zhiboDumpClasses(void) {
-    NSArray *keys = @[@"splash", @"launchAd", @"OpenScreen", @"开屏", @"广告", @"弹窗",
-                      @"ABU", @"BUSplash", @"JgAds", @"GDT", @"KSAd", @"Sigmob",
-                      @"SplashAd", @"SplashView", @"AdView", @"Interstitial", @"Popup"];
-    NSMutableArray *hits = [NSMutableArray array];
-    unsigned int count = 0;
-    Class *classes = objc_copyClassList(&count);
-    if (classes) {
-        for (unsigned int i = 0; i < count; i++) {
-            NSString *name = NSStringFromClass(classes[i]);
-            for (NSString *k in keys) {
-                if ([name rangeOfString:k options:NSCaseInsensitiveSearch].location != NSNotFound) {
-                    [hits addObject:name];
-                    break;
-                }
-            }
-        }
-        free(classes);
-    }
-    splash_adblock_log([NSString stringWithFormat:@"[zhibo][classes] ad-like=%lu", (unsigned long)hits.count]);
-    NSUInteger lim = MIN(hits.count, 120);
-    for (NSUInteger i = 0; i < lim; i++) {
-        splash_adblock_log([NSString stringWithFormat:@"   %@", hits[i]]);
-    }
-}
-
-static void splash_adblock_zhiboDumpMethods(void) {
-    NSMutableArray *targets = [NSMutableArray array];
-    NSMutableArray *zbOwn = [NSMutableArray array];
-    unsigned int count = 0;
-    Class *classes = objc_copyClassList(&count);
-    if (classes) {
-        for (unsigned int i = 0; i < count; i++) {
-            NSString *name = NSStringFromClass(classes[i]);
-            // 直播吧自有类优先：开屏容器/管理/动画/弹窗
-            if ([name hasPrefix:@"ZB"] &&
-                ([name rangeOfString:@"Splash"].location != NSNotFound ||
-                 [name rangeOfString:@"Popup"].location != NSNotFound ||
-                 [name rangeOfString:@"Advert"].location != NSNotFound)) {
-                [zbOwn addObject:name];
-            } else if (splash_adblock_zhiboNameLooksLikeAd(name)) {
-                [targets addObject:name];
-            }
-        }
-        free(classes);
-    }
-    // 自有类排前面，确保优先被 dump 到
-    [targets insertObjects:zbOwn atIndexes:[NSIndexSet indexSetWithIndexesInRange:NSMakeRange(0, zbOwn.count)]];
-    NSUInteger lim = MIN(targets.count, 60);
-    splash_adblock_log([NSString stringWithFormat:@"[zhibo][methods] ad-like classes=%lu (dump %lu)",
-                        (unsigned long)targets.count, (unsigned long)lim]);
-    for (NSUInteger i = 0; i < lim; i++) {
-        NSString *n = targets[i];
-        Class c = NSClassFromString(n);
-        if (!c) continue;
-        unsigned int mc = 0;
-        Method *ms = class_copyMethodList(c, &mc);
-        NSMutableArray *sels = [NSMutableArray array];
-        for (unsigned int j = 0; j < mc; j++) {
-            [sels addObject:NSStringFromSelector(method_getName(ms[j]))];
-        }
-        if (ms) free(ms);
-        splash_adblock_log([NSString stringWithFormat:@"[CLASS] %@ :: %@", n,
-                            [sels componentsJoinedByString:@", "]]);
-    }
-}
-
-// v0.1.2：对开屏等待相关的关键类 dump「方法名 + typeEncoding」。
-// 只有拿到准确 typeEncoding，下一版才能安全 hook（猜参数类型会崩）。
-static void splash_adblock_zhiboDumpTargetSignatures(void) {
-    NSArray *targets = @[
-        @"ZBSplashAdViewController",   // 开屏 VC：找 dismiss/finish/close 回调
-        @"ZBSplashView",                // 开屏容器
-        @"BaseNAViewController",        // 启动期 root
-        @"ZBRootNaviViewController",    // 主界面 root
-        @"ZBSingleAdvertRequestManager",// availableTimeout / fetchAd
-        @"ZBAdvertRequestManager",
-        @"ZBAppAdvertConfig",           // splash_total_timeout 等配置
-        @"ZBSplashAnimationManager"
-    ];
-    for (NSString *n in targets) {
-        Class c = NSClassFromString(n);
-        if (!c) {
-            splash_adblock_log([NSString stringWithFormat:@"[SIG] %@ :: NOT FOUND", n]);
-            continue;
-        }
-        unsigned int mc = 0;
-        Method *ms = class_copyMethodList(c, &mc);
-        NSMutableArray *lines = [NSMutableArray array];
-        for (unsigned int j = 0; j < mc; j++) {
-            const char *enc = method_getTypeEncoding(ms[j]);
-            [lines addObject:[NSString stringWithFormat:@"%@|%@",
-                              NSStringFromSelector(method_getName(ms[j])),
-                              enc ? [NSString stringWithUTF8String:enc] : @"?"]];
-        }
-        if (ms) free(ms);
-        splash_adblock_log([NSString stringWithFormat:@"[SIG] %@ (%u) :: %@", n, mc,
-                            [lines componentsJoinedByString:@", "]]);
-    }
-}
-
 // 只对「命中广告类名 + 接近全屏」的 view 做 alpha=0，跳过 root view，不碰主界面。
 static void splash_adblock_zhiboFadeRecursive(UIView *v, UIWindow *win, BOOL isRoot) {
     if (!v || isRoot) return;
@@ -418,25 +308,20 @@ static void splash_adblock_zhiboStartWindowObserver(void) {
     });
 }
 
-// 一次性探针入口：类名/方法各 dump 一次；视图树用递减频率的有限次 tick
-// 覆盖到 75s（为了抓「进去之后的弹窗」），不是常驻轮询。
+// v0.1.5：开屏已精准 hook（ZBSplashView）、黑屏已解决（displayRootViewController），
+// 开屏诊断探针（类名/方法/签名 dump、窗口树 tick、root 记录）全部移除。
+// 只保留「弹窗」的事件驱动探针：present VC + 新 window 观察（各限次、120s 自动失效），
+// 加 3 次轻量兜底 tick（只在命中时写日志），等弹窗真弹出时抓类名。
 static void splash_adblock_zhiboStartProbe(void) {
     if (!splash_adblock_enabled() || !splash_adblock_isZhibo8()) return;
     splash_adblock_zhiboLaunchTime = [[NSDate date] timeIntervalSince1970];
-    splash_adblock_log(@"[zhibo] === probe start: splash + popup ===");
-    splash_adblock_zhiboDumpClasses();
-    splash_adblock_zhiboDumpMethods();
-    splash_adblock_zhiboDumpTargetSignatures();
-    NSArray *ticks = @[@0.5, @1.5, @3.0, @6.0, @12.0, @25.0, @45.0, @75.0];
+    splash_adblock_log(@"[zhibo] popup probe active (splash already precise-hooked)");
+    NSArray *ticks = @[@1.5, @6.0, @20.0];
     for (NSNumber *t in ticks) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(t.doubleValue * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             if (!splash_adblock_zhiboProbeActive()) return;
-            splash_adblock_zhiboFadeFullscreenAds();
-            UIWindow *key = [UIApplication sharedApplication].keyWindow;
-            splash_adblock_log([NSString stringWithFormat:@"[zhibo][root@%.1fs] keyRoot=%@",
-                                t.doubleValue, NSStringFromClass([key.rootViewController class])]);
-            splash_adblock_zhiboDumpWindows([NSString stringWithFormat:@"%.1fs", t.doubleValue]);
+            splash_adblock_zhiboFadeFullscreenAds(); // 命中才写日志，无命中静默
         });
     }
     splash_adblock_zhiboStartWindowObserver();
@@ -511,26 +396,18 @@ static void splash_adblock_zhiboStartProbe(void) {
 }
 %end
 
-#pragma mark - 直播吧开屏 VC 生命周期探针（v0.1.2，只记录不改行为）
+#pragma mark - 直播吧开屏 VC（v0.1.5：移除生命周期探针，保留提前显示主界面修复）
 
-// 目的：定位开屏 VC 何时创建/显示/消失，以及主界面何时接管，
-// 为下一版「安全缩短黑屏等待」找准确的介入时机。不调用任何私有方法。
+// 黑屏诊断已完成，v0.1.2 的 viewDidLoad/viewDidAppear/viewWillDisappear
+// 生命周期日志与 displayRootViewController 调用日志全部移除。只保留修复动作本身。
 static inline double splash_adblock_zhiboElapsed(void) {
     return [[NSDate date] timeIntervalSince1970] - splash_adblock_zhiboLaunchTime;
 }
 
 %hook ZBSplashAdViewController
-- (void)viewDidLoad {
-    %orig;
-    if (splash_adblock_enabled() && splash_adblock_isZhibo8())
-        splash_adblock_log([NSString stringWithFormat:@"[zhibo][life] SplashVC viewDidLoad t=%.2f",
-                            splash_adblock_zhiboElapsed()]);
-}
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
     if (splash_adblock_enabled() && splash_adblock_isZhibo8()) {
-        splash_adblock_log([NSString stringWithFormat:@"[zhibo][life] SplashVC viewDidAppear t=%.2f",
-                            splash_adblock_zhiboElapsed()]);
         // v0.1.4：开屏已 fade，立即触发 App 自带的 displayRootViewController，
         // 让主界面在下一 runloop 就挂上（延迟 0.02s，视觉 0 黑屏）。
         // 进程内只主动调用一次；%orig 全保留，不掐断广告加载/计时/回调链。
@@ -558,19 +435,6 @@ static inline double splash_adblock_zhiboElapsed(void) {
             });
         });
     }
-}
-- (void)viewWillDisappear:(BOOL)animated {
-    %orig;
-    if (splash_adblock_enabled() && splash_adblock_isZhibo8())
-        splash_adblock_log([NSString stringWithFormat:@"[zhibo][life] SplashVC viewWillDisappear t=%.2f",
-                            splash_adblock_zhiboElapsed()]);
-}
-// 观察 App 自己何时调用（我们提前触发那次也会进这里），判断是否需要调整延迟。
-- (void)displayRootViewController {
-    if (splash_adblock_enabled() && splash_adblock_isZhibo8())
-        splash_adblock_log([NSString stringWithFormat:@"[zhibo][root] displayRootViewController invoked t=%.2f",
-                            splash_adblock_zhiboElapsed()]);
-    %orig;
 }
 %end
 
@@ -659,10 +523,9 @@ static inline double splash_adblock_zhiboElapsed(void) {
     if (splash_adblock_zhiboVCCount >= 60) return;
     splash_adblock_zhiboVCCount++;
     NSString *cls = NSStringFromClass([self class]);
-    CGFloat level = self.view.window ? self.view.window.windowLevel : -1;
-    splash_adblock_log([NSString stringWithFormat:@"[zhibo][vc] VC=%@ level=%.0f", cls, level]);
 
-    // 命中开屏特征 VC -> 事件驱动兜底（一次性延迟补刀，非轮询）
+    // v0.1.5：普通 VC 不再逐个写日志（消除每次启动的垃圾日志）。
+    // 命中广告特征 VC -> 事件驱动兜底（一次性延迟补刀，非轮询），只在此刻记录。
     if (splash_adblock_zhiboNameLooksLikeAd(cls)) {
         splash_adblock_log([NSString stringWithFormat:@"[zhibo][MATCH] ad-like VC=%@ -> fade", cls]);
         __weak UIViewController *weakSelf = self;

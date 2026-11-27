@@ -753,12 +753,17 @@ static void splash_adblock_wpDismissSplash(UIViewController *vc, NSInteger attem
 }
 
 // 命中开屏 VC 的统一入口（present 与 viewDidAppear 两处都调，同一个 VC 只处理一次）。
+// 进程内最多处理 5 次：正常情况下只有 1 次；万一 SDK 判"未展示"重弹，也能再清，
+// 但有上限，绝不会出现"dismiss→重弹→dismiss"的无尽循环。
 static __weak UIViewController *splash_adblock_wpHandledVC = nil;
+static NSInteger splash_adblock_wpHandledCount = 0;
 
 static void splash_adblock_wpHandleSplashVC(UIViewController *vc, NSString *where) {
     if (!vc || !splash_adblock_wpActive()) return;
     if (vc == splash_adblock_wpHandledVC) return;
+    if (splash_adblock_wpHandledCount >= 5) return;
     splash_adblock_wpHandledVC = vc;
+    splash_adblock_wpHandledCount++;
     splash_adblock_log([NSString stringWithFormat:@"[wp][MATCH] splash VC=%@ via %@ -> blank + dismiss",
                         NSStringFromClass([vc class]), where]);
     splash_adblock_fadeTree(vc.view);

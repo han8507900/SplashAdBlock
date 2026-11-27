@@ -4,7 +4,7 @@
 #import "SplashAdBlockPrivate.h"
 
 // ============================================================================
-// 通用屏蔽插件（v0.3.3）
+// 通用屏蔽插件（v0.3.4）
 //
 // 已精准适配（屏蔽逻辑一行未改）：
 //  · 掌盟 com.tencent.ied.app.lolbible —— 广点通 GDT 开屏（透明化）
@@ -17,21 +17,24 @@
 //  · 百度地图 com.baidu.map            —— BMSplashMaterialManager isSplashShowClosed=YES
 //                                        （竞品逆向，已真机验证定版）
 //  · 铁路12306 cn.12306.rails12306     —— 吞两个数据注入 setter（竞品逆向，已定版）
-//  · 下厨房 com.xiachufang.recipe      —— 倍孜 BeiZiSDK：吞 BeiZi_loadSplashAd
-//                                        从根源杜绝开屏 view + 摇一摇传感器跳转
+//  · 下厨房 com.xiachufang.recipe      —— 揭启动占位窗口 + 倍孜广告 VC 透明 + 启动期
+//                                        拦 openURL 防摇一摇跳转
 //
-// v0.3.3 下厨房转精准（依据 v0.3.2 真机日志）：
-//  · 日志确认：开屏 VC=BeiZiSplashImageViewController，SDK=倍孜 BeiZiSDK；
-//    v0.3.2 的 fade 虽让广告不可见，但摇一摇跳转由 SDK 传感器驱动，view 透明化管不到。
-//  · 正解：吞掉 BeiZiSplash -BeiZi_loadSplashAd（SDK 不创建开屏对象 → 无 view、
-//    无传感器、无跳转）。这是 App/SDK 设计内的"无广告可展示"态，与 12306 同构；
-//    日志证明下厨房先进主页（window#1=XCFTabbarViewController），不加载不卡启动。
-//  · 保留 BeiZiSplashImageViewController 精准 fade 作兜底；移除全部诊断探针。
+// v0.3.4 下厨房修正（v0.3.3 真机反馈：启动屏变长 + 仍有广告）：
+//  · 教训：v0.3.3 吞 BeiZi_loadSplashAd 后 SDK 不再回调，下厨房的
+//    recipe.LaunchScreenPlaceholderVC（level=1999 占位窗口）没人来关 → 启动屏反而更久；
+//    同时撤了窗口级兜底，启动海报重新可见。→ 这里不能"掐断加载让 SDK 沉默"。
+//  · 本版：① BeiZi_loadSplashAd 恢复 %orig（回调链完整，占位按时关闭）；
+//          ② runtime hook LaunchScreenPlaceholderVC.viewDidAppear:，主界面就绪后
+//             把占位窗口 alpha=0（不 hidden、不移除）→ 启动屏瞬过 + 海报不可见；
+//          ③ 倍孜系广告 VC（类名含 BeiZi）viewDidAppear/viewDidLayoutSubviews 全树透明；
+//          ④ 启动期 12s shield 内吞 UIApplication openURL（放行 file:// 与自身 scheme）
+//             阻止摇一摇把用户甩到别的 App。
 //
 // 日志策略（用户要求"取消每次打开生成日志，后续每个 App 同样处理"）：
 //  · splash_adblock_logEnabled 开关——已定版 App 一律不写日志文件，启动时清理历史残留；
 //    仅"诊断中"新接入 App 写日志供真机验证，定版后移出白名单。当前下厨房验证期写日志，
-//    真机确认摇一摇不再跳后，下一版移出白名单。
+//    真机确认无广告 / 启动快 / 不跳转后，下一版移出白名单。
 //  · /tmp 加载标记固定名覆盖写（非 .log、不累积），保留用于确认注入成功。
 //  无常驻轮询；block 用 __weak；包名不变。其他 App hook 一行未改。
 // ============================================================================
@@ -81,7 +84,7 @@ static BOOL splash_adblock_isXiachufang(void) {
 }
 
 // ---------- 轻量日志（按需开关，无常驻监听、无轮询） ----------
-#define SPLASH_ADBLOCK_VERSION @"0.3.3"
+#define SPLASH_ADBLOCK_VERSION @"0.3.4"
 
 // v0.3.2：日志默认关闭——已定版 App 每次启动不再生成任何日志文件。
 // 只有"诊断中"的新接入 App 才写日志（真机验证 hook 命中用），定版后从白名单移除。
@@ -391,33 +394,140 @@ static void splash_adblock_zhiboStartProbe(void) {
 
 #pragma mark - 下厨房开屏（倍孜 BeiZi SDK，仅下厨房生效）
 
-// 依据 v0.3.2 真机日志定位：
-//  · 开屏 VC = BeiZiSplashImageViewController，位于 level=1999 的独立 window；
-//  · v0.3.2 的 fade 让广告不可见，但"摇一摇跳其他 App"由倍孜 SDK 的传感器驱动，
-//    view 透明化无法阻止——必须让 SDK 根本不进入开屏流程。
-// 倍孜官方 API：BeiZiSplash 的 -BeiZi_loadSplashAd 是开屏加载入口。
-// 吞掉它 = SDK 不请求、不创建 BeiZiSplashImageViewController = 无 view、无传感器、
-// 无摇一摇跳转。这是 App/SDK 设计内的"本次无广告可展示"状态（与 12306 吞注入同构），
-// 不是掐断 show/load 回调：下厨房是"先进主页后异步弹广告"，日志 window#1 已是主界面
-// XCFTabbarViewController，不加载广告不影响进主页，不黑屏、不卡启动。
-// 门控：仅启用开关 + bundle=com.xiachufang.recipe 时吞加载；其余 App/关闭状态完全 %orig。
-%hook BeiZiSplash
-- (void)BeiZi_loadSplashAd {
-    if (!splash_adblock_enabled() || !splash_adblock_isXiachufang()) {
-        %orig;
+// 演进记录（每条都基于真机日志，不猜）：
+//  v0.3.2（探针版）：日志 window#2 level=1999 root=recipe.LaunchScreenPlaceholderVC
+//    —— 下厨房自己用一个"启动占位窗口"盖住主界面等开屏；window#1 已是
+//    recipe.XCFTabbarViewController（主界面其实早就 ready）。广告 VC =
+//    BeiZiSplashImageViewController。fade 后广告不可见，但摇一摇仍跳（传感器驱动）。
+//  v0.3.3（吞加载）：吞 BeiZi_loadSplashAd 后 SDK 不回任何回调，占位窗口没人来关，
+//    → 启动屏时间反而变长；同时撤掉了窗口级兜底，启动海报重新可见（用户看到"还有广告"）。
+//    教训：这里不能"掐断加载让 SDK 沉默"，必须让它走完整回调链。
+//  v0.3.4（本版）正解三步，全部是"走 App/SDK 自己的路径"，不掐断任何回调：
+//    ① BeiZi_loadSplashAd 恢复 %orig：SDK 正常加载/计时/回调，占位窗口按时关闭→启动不变长。
+//    ② runtime hook recipe.LaunchScreenPlaceholderVC 的 viewDidAppear:：确认主界面
+//       window 已可见后，把该占位窗口 alpha=0（不 hidden、不移除），主界面立刻透出
+//       → 启动屏几乎瞬过、启动海报不可见。最多重试 20 次×0.15s（约 3s，超时即放弃），
+//       无定时器、无轮询、无长期驻留。
+//    ③ 广告 VC（BeiZiSplashImageViewController 及其它 BeiZi 系）viewDidAppear /
+//       viewDidLayoutSubviews 时整树 alpha=0：保留 SDK 的展示/计时/回调链，只是不可见。
+//    ④ 摇一摇跳转：启动占位出现后 12s 内（shield 窗口）吞掉 UIApplication 的
+//       openURL: 与 openURL:options:completionHandler:（放行 file:// 与下厨房自身 scheme）。
+//       这是"不许在开屏期把用户甩到别的 App"，不碰 SDK 内部传感器与广告回调。
+
+// ---- 摇一摇跳转防护（启动期 shield 窗口） ----
+static NSTimeInterval splash_adblock_xcfShieldUntil = 0;
+
+static BOOL splash_adblock_xcfShouldBlockURL(NSURL *url) {
+    if (!splash_adblock_enabled() || !splash_adblock_isXiachufang()) return NO;
+    if (splash_adblock_xcfShieldUntil <= 0) return NO;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (now > splash_adblock_xcfShieldUntil) return NO;
+    NSString *scheme = url.scheme.lowercaseString ?: @"";
+    if (scheme.length == 0) return NO;
+    if ([scheme isEqualToString:@"file"]) return NO;
+    if ([scheme isEqualToString:@"xiachufang"]) return NO;
+    if ([scheme hasPrefix:@"com.xiachufang"]) return NO;
+    return YES;
+}
+
+static void splash_adblock_xcfArmShield(NSTimeInterval seconds) {
+    NSTimeInterval until = [[NSDate date] timeIntervalSince1970] + seconds;
+    if (until > splash_adblock_xcfShieldUntil) splash_adblock_xcfShieldUntil = until;
+}
+
+// ---- 启动占位窗口：主界面就绪即揭掉（alpha=0，不 hidden、不移除） ----
+static NSInteger splash_adblock_xcfPlaceholderRetries = 0;
+
+static BOOL splash_adblock_xcfMainUIReady(UIWindow *placeholderWindow) {
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        if (w == placeholderWindow) continue;
+        if (w.isHidden || w.alpha <= 0.01) continue;
+        if (w.windowLevel > 100) continue;
+        NSString *n = NSStringFromClass([w.rootViewController class]) ?: @"";
+        if ([n rangeOfString:@"tabbar" options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+        if ([n rangeOfString:@"tabbarcontroller" options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+    }
+    return NO;
+}
+
+static void splash_adblock_xcfRevealMain(UIViewController *vc);
+
+static void splash_adblock_xcfRevealMain(UIViewController *vc) {
+    if (!vc) return;
+    if (!splash_adblock_enabled() || !splash_adblock_isXiachufang()) return;
+    UIWindow *w = vc.view.window;
+    if (w && splash_adblock_xcfMainUIReady(w)) {
+        splash_adblock_fadeTree(vc.view);
+        w.alpha = 0.0;
+        w.userInteractionEnabled = NO;
+        splash_adblock_xcfArmShield(12.0);
+        splash_adblock_log(@"[xcf][hook] LaunchScreenPlaceholderVC -> window alpha=0 (main UI revealed)");
         return;
     }
-    static dispatch_once_t logOnce;
-    dispatch_once(&logOnce, ^{
-        splash_adblock_log(@"[xcf][hook] BeiZiSplash BeiZi_loadSplashAd -> swallow (no splash, no shake)");
+    if (splash_adblock_xcfPlaceholderRetries >= 20) return;   // 20×0.15s≈3s 上限，之后放弃（不长期驻留）
+    splash_adblock_xcfPlaceholderRetries++;
+    __weak UIViewController *weakVC = vc;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        splash_adblock_xcfRevealMain(weakVC);
     });
-    // 不调 %orig：SDK 不加载开屏，从根源杜绝广告 view 与摇一摇传感器跳转。
+}
+
+// Swift 类名带模块前缀（recipe.LaunchScreenPlaceholderVC），Logos 的 %hook 无法表达，
+// 用 runtime 手动 hook：只替换 imp，保留原实现并在前置调用，行为链不变。
+static void (*splash_adblock_xcfPlaceholderOrigDidAppear)(id, SEL, BOOL) = NULL;
+
+static void splash_adblock_xcfPlaceholderDidAppear(id self, SEL _cmd, BOOL animated) {
+    if (splash_adblock_xcfPlaceholderOrigDidAppear) {
+        splash_adblock_xcfPlaceholderOrigDidAppear(self, _cmd, animated);
+    }
+    if (!splash_adblock_enabled() || !splash_adblock_isXiachufang()) return;
+    if (![self isKindOfClass:[UIViewController class]]) return;
+    splash_adblock_log(@"[xcf][hook] LaunchScreenPlaceholderVC viewDidAppear -> schedule reveal");
+    __weak UIViewController *weakVC = (UIViewController *)self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        splash_adblock_xcfRevealMain(weakVC);
+    });
+}
+
+static void splash_adblock_xcfInstallPlaceholderHook(void) {
+    if (!splash_adblock_enabled() || !splash_adblock_isXiachufang()) return;
+    Class cls = objc_getClass("recipe.LaunchScreenPlaceholderVC");
+    if (!cls) cls = objc_getClass("LaunchScreenPlaceholderVC");
+    if (!cls) {
+        splash_adblock_log(@"[xcf][hook] LaunchScreenPlaceholderVC not found (will rely on window fade)");
+        return;
+    }
+    SEL sel = @selector(viewDidAppear:);
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) {
+        splash_adblock_log(@"[xcf][hook] LaunchScreenPlaceholderVC viewDidAppear: not found");
+        return;
+    }
+    if (!splash_adblock_xcfPlaceholderOrigDidAppear) {
+        splash_adblock_xcfPlaceholderOrigDidAppear = (void *)method_getImplementation(m);
+        method_setImplementation(m, (IMP)splash_adblock_xcfPlaceholderDidAppear);
+        splash_adblock_log(@"[xcf][hook] LaunchScreenPlaceholderVC viewDidAppear: hooked");
+    }
+}
+
+// 倍孜开屏加载：显式走原实现（v0.3.3 曾吞掉导致 SDK 不回调、启动屏变长，已纠正）。
+// 保留 hook 只为一行诊断日志，逻辑等价于不 hook。
+%hook BeiZiSplash
+- (void)BeiZi_loadSplashAd {
+    if (splash_adblock_enabled() && splash_adblock_isXiachufang()) {
+        static dispatch_once_t logOnce;
+        dispatch_once(&logOnce, ^{
+            splash_adblock_log(@"[xcf][hook] BeiZiSplash BeiZi_loadSplashAd -> pass-through (callbacks kept)");
+        });
+    }
+    %orig;
 }
 %end
 
-// 精准 fade 兜底：万一有别的代码路径直接创建 BeiZiSplashImageViewController
-// （非 loadSplashAd 入口，如点睛/复用），在它出现时把整棵树 alpha=0。
-// 只做 alpha=0，不 hidden、不移除、不碰广告 SDK 的计时/回调链。
+// 广告 VC 整树 alpha=0：只做透明，不 hidden、不移除、不碰广告 SDK 的计时/回调链。
+// viewDidAppear 时同时武装 12s 摇一摇 shield（广告在屏期间不许甩到别的 App）。
 %hook BeiZiSplashImageViewController
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
@@ -426,12 +536,34 @@ static void splash_adblock_zhiboStartProbe(void) {
     dispatch_once(&logOnce, ^{
         splash_adblock_log(@"[xcf][hook] BeiZiSplashImageViewController viewDidAppear -> fade");
     });
+    splash_adblock_xcfArmShield(12.0);
     splash_adblock_fadeTree(self.view);
 }
 - (void)viewDidLayoutSubviews {
     %orig;
     if (!splash_adblock_enabled() || !splash_adblock_isXiachufang()) return;
     splash_adblock_fadeTree(self.view);
+}
+%end
+
+// 摇一摇跳转拦截：只在 shield 窗口内、只拦"离开本 App"的 URL。
+// 放行 file:// 与下厨房自身 scheme，避免影响 App 内部跳转。
+%hook UIApplication
+- (BOOL)openURL:(NSURL *)url {
+    if (splash_adblock_xcfShouldBlockURL(url)) {
+        splash_adblock_log([NSString stringWithFormat:@"[xcf][shield] block openURL:%@", url.absoluteString]);
+        return NO;
+    }
+    return %orig;
+}
+- (void)openURL:(NSURL *)url options:(NSDictionary<NSString *, id> *)options
+        completionHandler:(void (^)(BOOL success))completion {
+    if (splash_adblock_xcfShouldBlockURL(url)) {
+        splash_adblock_log([NSString stringWithFormat:@"[xcf][shield] block openURL:%@ options", url.absoluteString]);
+        if (completion) completion(NO);
+        return;
+    }
+    %orig;
 }
 %end
 
@@ -836,6 +968,14 @@ static inline double splash_adblock_zhiboElapsed(void) {
     }
 
     // v0.1.7：微博不再做逐 VC 泛化 fade（误伤启动页根因），开屏靠 WBAdSdkFlashAdView 精准 hook。
+    // v0.3.4：下厨房只对「倍孜系广告 VC」（类名含 BeiZi）整树透明 + 武装 shield，
+    //         精准按类名前缀判断，不遍历视图树、不写诊断日志，无副作用。
+    //         这样即使广告是 BeiZi 的视频/原生开屏 VC（非 ImageViewController）也一并不可见。
+    if (splash_adblock_enabled() && splash_adblock_isXiachufang()
+        && [cls rangeOfString:@"BeiZi" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+        splash_adblock_xcfArmShield(12.0);
+        splash_adblock_fadeTree(self.view);
+    }
 }
 %end
 
@@ -852,9 +992,10 @@ static inline double splash_adblock_zhiboElapsed(void) {
         // 清理本 App 历史日志，只保留最近 2 份（当前这份是最新的，不会被删）
         splash_adblock_pruneOldLogs();
 
-        // 直播吧：启动弹窗探针；下厨房/微博：精准 hook 走事件驱动，无 ctor 探针。
-        // 微博提前进主界面由广告 VC viewDidAppear 触发官方 adld_advanceShowAppContent。
+        // 直播吧：启动弹窗探针；下厨房：安装启动占位 VC 的 runtime hook（主界面就绪即揭掉
+        // 占位窗口）；微博：提前进主界面由广告 VC viewDidAppear 事件驱动。
         // 其余 App 内部门控直接返回。
         splash_adblock_zhiboStartProbe();
+        splash_adblock_xcfInstallPlaceholderHook();
     }
 }

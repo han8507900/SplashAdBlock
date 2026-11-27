@@ -54,10 +54,15 @@
 - (void)setHidden:(BOOL)hidden;
 @end
 
-// 广告 window(level=2100) 的 root VC，广告出现时在此提前切主界面。
+// 广告 window(level=2100) 的 root VC，广告出现时在此触发"提前进主界面"。
 @interface WBAdSdkNewRootViewController : UIViewController
 - (void)viewDidAppear:(BOOL)animated;
-- (void)displayRootViewController;
+@end
+
+// 启动页 VC（v0.1.9 [SIG] 确认 66 方法）。真正持有"切主界面"入口的对象：
+// adld_advanceShowAppContent 是微博官方"广告完成→进主界面"推进方法。
+@interface WBLaunchNewViewController : UIViewController
+- (void)viewDidLoad;
 @end
 
 // -------- 评分弹窗 --------

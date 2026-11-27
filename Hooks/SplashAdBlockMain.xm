@@ -4,7 +4,7 @@
 #import "SplashAdBlockPrivate.h"
 
 // ============================================================================
-// 通用屏蔽插件（v0.3.1）
+// 通用屏蔽插件（v0.3.2）
 //
 // 已精准适配（屏蔽逻辑一行未改）：
 //  · 掌盟 com.tencent.ied.app.lolbible —— 广点通 GDT 开屏（透明化）
@@ -15,18 +15,20 @@
 //  · 微博   com.sina.weibo             —— 启动页 VC 提前 adld_advanceShowAppContent
 //                                        + WBAdSdkFlashAdView 精准 fade（已定版）
 //  · 百度地图 com.baidu.map            —— BMSplashMaterialManager isSplashShowClosed=YES
-//                                        （竞品逆向，已真机验证定版，v0.3.1 起关日志）
+//                                        （竞品逆向，已真机验证定版）
+//  · 铁路12306 cn.12306.rails12306     —— 吞两个数据注入 setter（竞品逆向）
+//                                        （已真机验证定版，v0.3.2 起关日志）
 //
-// v0.3.1 新增铁路12306：
-//  · 铁路12306 cn.12306.rails12306：学习竞品「广告终结者」12306.dylib——
-//    不调 orig 吞掉 AdvertisService -setBonSplashAd: 与 MTBookTicketHomeTopADView
-//    -setMaterialsList: 的广告注入。这是两个"数据注入 setter"，等价于告诉 App
-//    "无广告可展示"，让它走自带的无开屏路径；不改广告加载/计时/回调链，符合
-//    "绝不掐断回调"约定（与百度地图同构）。诊断白名单=12306，验证通过后移出。
+// v0.3.2 新增下厨房（诊断版）：
+//  · 下厨房 com.xiachufang.recipe：竞品库无专属 dylib、公开资料仅网络层抓包方案，
+//    暂无可照抄的 Objective-C 类名。按"不猜选择器"原则，本版先用诊断探针 +
+//    保守兜底：抓启动期 window / VC / 广告 view 类名写日志；对"命中广告特征
+//    且近全屏"的 view 做 alpha=0（不 hidden、不移除、不碰计时/回调链）。
+//    真机日志定位真实类名后，下一版换成精准 hook 并移除探针。
 //
 // 日志策略（用户要求"取消每次打开生成日志，后续每个 App 同样处理"）：
 //  · splash_adblock_logEnabled 开关——已定版 App 一律不写日志文件，启动时清理历史残留；
-//    仅"诊断中"新接入 App（当前=铁路12306）写日志供真机验证，定版后移出白名单。
+//    仅"诊断中"新接入 App（当前=下厨房）写日志供真机验证，定版后移出白名单。
 //  · /tmp 加载标记固定名覆盖写（非 .log、不累积），保留用于确认注入成功。
 //  无常驻轮询；block 用 __weak；包名不变。其他 App hook 一行未改。
 // ============================================================================
@@ -70,16 +72,21 @@ static BOOL splash_adblock_isRail12306(void) {
     return [b isEqualToString:@"cn.12306.rails12306"];
 }
 
-// ---------- 轻量日志（按需开关，无常驻监听、无轮询） ----------
-#define SPLASH_ADBLOCK_VERSION @"0.3.1"
+static BOOL splash_adblock_isXiachufang(void) {
+    NSString *b = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+    return [b isEqualToString:@"com.xiachufang.recipe"];
+}
 
-// v0.3.1：日志默认关闭——已定版 App 每次启动不再生成任何日志文件。
+// ---------- 轻量日志（按需开关，无常驻监听、无轮询） ----------
+#define SPLASH_ADBLOCK_VERSION @"0.3.2"
+
+// v0.3.2：日志默认关闭——已定版 App 每次启动不再生成任何日志文件。
 // 只有"诊断中"的新接入 App 才写日志（真机验证 hook 命中用），定版后从白名单移除。
-// 变更记录：v0.3.0 百度地图诊断 → v0.3.1 百度地图已验证定版，移出白名单；
-// 当前诊断白名单：铁路12306（新接入，待验证）。其余 App 一律不写日志。
+// 变更记录：v0.3.1 铁路12306 已验证定版，移出白名单；
+// 当前诊断白名单：下厨房（新接入，待验证）。其余 App 一律不写日志。
 static BOOL splash_adblock_logEnabled(void) {
     NSString *bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
-    return [bundle isEqualToString:@"cn.12306.rails12306"];
+    return [bundle isEqualToString:@"com.xiachufang.recipe"];
 }
 
 // 本次会话的唯一标志（版本号 + 启动时间戳），进程内只生成一次。
@@ -104,6 +111,7 @@ static NSString *splash_adblock_logTag(void) {
     if ([bundle isEqualToString:@"com.smzdm.client.ios"]) tag = @"smzdm";
     if ([bundle isEqualToString:@"com.zhibo8.tenyears"]) tag = @"zhibo8";
     if ([bundle isEqualToString:@"cn.12306.rails12306"]) tag = @"12306";
+    if ([bundle isEqualToString:@"com.xiachufang.recipe"]) tag = @"xiachufang";
     return tag;
 }
 
@@ -376,6 +384,112 @@ static void splash_adblock_zhiboStartProbe(void) {
         });
     }
     splash_adblock_zhiboStartWindowObserver();
+}
+
+#pragma mark - 下厨房：开屏诊断探针 + 保守兜底（仅下厨房生效，v0.3.2 诊断版）
+
+// 竞品库无下厨房 dylib、公开资料仅网络层抓包方案，暂无可照抄的 Objective-C 类名。
+// 按"不猜选择器"原则：本版先抓启动期 window / VC / 广告 view 类名写日志，同时对
+// "命中广告特征 + 近全屏"的 view 做 alpha=0 保守兜底（不 hidden、不移除、不碰
+// 广告 SDK 的计时/回调链）。真机日志定位真实类名后，下一版换成精准 hook 并移除探针。
+
+static NSTimeInterval splash_adblock_xcfLaunchTime = 0;
+static NSInteger splash_adblock_xcfPresentCount = 0;
+static NSInteger splash_adblock_xcfVCCount = 0;
+static NSInteger splash_adblock_xcfWindowCount = 0;
+static id splash_adblock_xcfWindowObserver = nil;
+
+// 探针只在启动后 120s 内有效：开屏出现在早期，不长期驻留。
+static BOOL splash_adblock_xcfProbeActive(void) {
+    if (!splash_adblock_enabled() || !splash_adblock_isXiachufang()) return NO;
+    NSTimeInterval elapsed = [[NSDate date] timeIntervalSince1970] - splash_adblock_xcfLaunchTime;
+    return elapsed >= 0 && elapsed <= 120;
+}
+
+// 广告类名关键词（复用直播吧同款泛化判断，命中才 fade，避免误伤主界面）。
+static BOOL splash_adblock_xcfNameLooksLikeAd(NSString *name) {
+    return splash_adblock_zhiboNameLooksLikeAd(name);
+}
+
+static void splash_adblock_xcfFadeRecursive(UIView *v, UIWindow *win, BOOL isRoot) {
+    if (!v || isRoot) return;
+    NSString *cls = NSStringFromClass([v class]);
+    CGRect f = v.frame;
+    CGSize s = win.bounds.size;
+    BOOL fullscreen = s.width > 0 && f.size.width >= s.width * 0.8
+                      && f.size.height >= s.height * 0.5;
+    if (fullscreen && splash_adblock_xcfNameLooksLikeAd(cls)) {
+        splash_adblock_log([NSString stringWithFormat:@"[xcf][MATCH] ad view %@ frame=%@ -> fade",
+                            cls, NSStringFromCGRect(f)]);
+        splash_adblock_fadeTree(v);
+    }
+    BOOL childIsRoot = [v isEqual:win.rootViewController.view];
+    for (UIView *sub in v.subviews) splash_adblock_xcfFadeRecursive(sub, win, childIsRoot);
+}
+
+static void splash_adblock_xcfFadeFullscreenAds(void) {
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        CGFloat level = w.windowLevel;
+        if (level > 100 && level < 3000) {
+            splash_adblock_log([NSString stringWithFormat:@"[xcf][MATCH] high-level window level=%.0f root=%@ -> fade",
+                                level, NSStringFromClass([w.rootViewController class])]);
+            splash_adblock_fadeTree(w);
+            continue;
+        }
+        for (UIView *v in w.subviews) {
+            splash_adblock_xcfFadeRecursive(v, w, [v isEqual:w.rootViewController.view]);
+        }
+    }
+}
+
+// 新 window 出现事件：抓 window 视图树；限 12 次，120s 后自动移除观察者。
+static void splash_adblock_xcfStartWindowObserver(void) {
+    splash_adblock_xcfWindowObserver =
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIWindowDidBecomeVisibleNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(NSNotification *note) {
+        if (!splash_adblock_xcfProbeActive()) return;
+        if (splash_adblock_xcfWindowCount >= 12) return;
+        splash_adblock_xcfWindowCount++;
+        UIWindow *w = note.object;
+        if (![w isKindOfClass:[UIWindow class]]) return;
+        splash_adblock_log([NSString stringWithFormat:@"[xcf][window#%ld] level=%.0f root=%@",
+                            (long)splash_adblock_xcfWindowCount, w.windowLevel,
+                            NSStringFromClass([w.rootViewController class])]);
+        NSInteger lines = 0;
+        NSMutableString *out = [NSMutableString string];
+        for (UIView *v in w.subviews) splash_adblock_zhiboDumpTree(v, 0, out, &lines);
+        splash_adblock_log(out);
+        if (w.windowLevel > 100 && w.windowLevel < 3000) {
+            splash_adblock_log(@"[xcf][MATCH] high-level window -> fade");
+            splash_adblock_fadeTree(w);
+        }
+    }];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(120 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (splash_adblock_xcfWindowObserver) {
+            [[NSNotificationCenter defaultCenter] removeObserver:splash_adblock_xcfWindowObserver];
+            splash_adblock_xcfWindowObserver = nil;
+            splash_adblock_log(@"[xcf] window observer removed");
+        }
+    });
+}
+
+// 启动时记录时间 + 3 次轻量兜底 tick（命中才写日志）+ 新 window 观察。
+static void splash_adblock_xcfStartProbe(void) {
+    if (!splash_adblock_enabled() || !splash_adblock_isXiachufang()) return;
+    splash_adblock_xcfLaunchTime = [[NSDate date] timeIntervalSince1970];
+    splash_adblock_log(@"[xcf] splash probe active (diagnostic + conservative fade)");
+    NSArray *ticks = @[@1.5, @6.0, @20.0];
+    for (NSNumber *t in ticks) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(t.doubleValue * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (!splash_adblock_xcfProbeActive()) return;
+            splash_adblock_xcfFadeFullscreenAds();
+        });
+    }
+    splash_adblock_xcfStartWindowObserver();
 }
 
 #pragma mark - 微博：启动页 VC 提前进主界面（修复启动图长等待，仅微博生效）
@@ -751,6 +865,30 @@ static inline double splash_adblock_zhiboElapsed(void) {
         }
     }
 
+    // ---- 下厨房：present VC 探针（事件驱动、限 15 次、120s 内） ----
+    if (splash_adblock_isXiachufang() && vc && splash_adblock_xcfProbeActive()
+        && splash_adblock_xcfPresentCount < 15) {
+        splash_adblock_xcfPresentCount++;
+        NSString *vcName = NSStringFromClass([vc class]);
+        NSString *msg = [vc isKindOfClass:[UIAlertController class]] ? ((UIAlertController *)vc).message : nil;
+        splash_adblock_log([NSString stringWithFormat:@"[xcf][present] VC=%@ title=%@ msg=%@",
+                            vcName, vc.title ?: @"", msg ?: @""]);
+        NSInteger lines = 0;
+        NSMutableString *out = [NSMutableString string];
+        splash_adblock_zhiboDumpTree(vc.view, 0, out, &lines);
+        splash_adblock_log(out);
+        if (splash_adblock_xcfNameLooksLikeAd(vcName)) {
+            splash_adblock_log([NSString stringWithFormat:@"[xcf][MATCH] ad-like popup VC=%@ -> fade", vcName]);
+            __weak UIViewController *weakVC = vc;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.02 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                UIViewController *strongVC = weakVC;
+                if (!strongVC || !splash_adblock_xcfProbeActive()) return;
+                splash_adblock_fadeTree(strongVC.view);
+            });
+        }
+    }
+
     // v0.1.9：微博开屏靠「精准 fade + 广告 VC viewDidAppear 提前切主界面」，无探针。
 }
 
@@ -776,6 +914,25 @@ static inline double splash_adblock_zhiboElapsed(void) {
             }
         }
     }
+
+    // ---- 下厨房：广告特征 VC -> 事件驱动兜底（限 60 次、120s 内、命中才 fade） ----
+    if (splash_adblock_xcfProbeActive()) {
+        if (splash_adblock_xcfVCCount < 60) {
+            splash_adblock_xcfVCCount++;
+            if (splash_adblock_xcfNameLooksLikeAd(cls)) {
+                splash_adblock_log([NSString stringWithFormat:@"[xcf][MATCH] ad-like VC=%@ -> fade", cls]);
+                __weak UIViewController *weakSelf = self;
+                for (NSNumber *d in @[@0.02, @0.2, @0.7]) {
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{
+                        UIViewController *strongSelf = weakSelf;
+                        if (!strongSelf || !splash_adblock_xcfProbeActive()) return;
+                        splash_adblock_fadeTree(strongSelf.view);
+                    });
+                }
+            }
+        }
+    }
     // v0.1.7：微博不再做逐 VC 泛化 fade（误伤启动页根因），开屏靠 WBAdSdkFlashAdView 精准 hook。
 }
 %end
@@ -793,9 +950,10 @@ static inline double splash_adblock_zhiboElapsed(void) {
         // 清理本 App 历史日志，只保留最近 2 份（当前这份是最新的，不会被删）
         splash_adblock_pruneOldLogs();
 
-        // 直播吧：启动弹窗探针；微博：提前进主界面由广告 VC viewDidAppear 事件驱动，
-        // 在启动页 VC 上调用官方 adld_advanceShowAppContent（不再 ctor 里枚举）。
-        // 其余 App 内部门控直接返回。
+        // 直播吧：启动弹窗探针；下厨房：开屏诊断探针（诊断版）；微博：提前进主界面
+        // 由广告 VC viewDidAppear 事件驱动，在启动页 VC 上调用官方
+        // adld_advanceShowAppContent（不再 ctor 里枚举）。其余 App 内部门控直接返回。
         splash_adblock_zhiboStartProbe();
+        splash_adblock_xcfStartProbe();
     }
 }

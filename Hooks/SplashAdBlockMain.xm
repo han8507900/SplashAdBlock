@@ -4,7 +4,7 @@
 #import "SplashAdBlockPrivate.h"
 
 // ============================================================================
-// 通用屏蔽插件（v0.1.9）
+// 通用屏蔽插件（v0.2.0）
 //
 // 已精准适配（屏蔽逻辑一行未改）：
 //  · 掌盟 com.tencent.ied.app.lolbible —— 广点通 GDT 开屏（透明化）
@@ -13,22 +13,21 @@
 //  · 直播吧 com.zhibo8.tenyears        —— ZBSplashView 开屏（精准透明化）
 //                                        + 提前 displayRootViewController 消黑屏
 //
-// v0.1.9 微博重构（相对 v0.1.8）：
-//  背景：v0.1.8 按竞品思路 hook -_canLoadAdNow 返回 NO，真机日志 hooked=0
-//        ——该 selector 属于信息流广告，微博开屏根本没有类实现它，方案无效。
-//        v0.1.6 完整日志确认真实链路：0.5s 启动页 WBLaunchNewViewController，
-//        1.5~6s level=2100 广告 window(WBAdSdkNewRootViewController)，
-//        12s 主 window 才切到主界面 TabBarRotateController。广告 view 虽被 fade，
-//        但微博仍跑满广告计时才切主界面 ->「启动图等待太长」。
-//  本版（复刻直播吧已验证的「提前切主界面」）：
-//        · 移除无效的 _canLoadAdNow 源头 hook。
-//        · hook 广告 VC WBAdSdkNewRootViewController 的 viewDidAppear，
-//          在广告 view 出现时提前触发「切到主界面」：尝试候选方法 +
-//          一次性 dump 启动页 VC / 广告 VC / 主界面的方法签名（只写一次、精简），
-//          下一版即可据日志固化为精准方法。保留 WBAdSdkFlashAdView 精准 fade。
-//  v0.1.9 日志改造：固定单文件名覆盖写（不再每次启动新建），首行带版本+时间戳；
-//        启动时清理历史累积日志；fade 日志去重，只记关键事件。
-//  无常驻轮询；objc_copyClassList/class_copyMethodList 配对 free；block 用 __weak；
+// v0.2.0 微博启动图长等待修复（相对 v0.1.9）：
+//  背景：v0.1.9 在「广告 VC」WBAdSdkNewRootViewController 上找切主界面入口，
+//        真机日志证实该 VC 仅有 12 个生命周期方法，只命中无效的
+//        dismissViewControllerAnimated:（关广告 VC 不切主界面），启动图仍等满 ~12s。
+//        v0.1.9 的 [SIG] 日志给出正解：启动页 VC WBLaunchNewViewController（66 方法）
+//        自带 adld_advanceShowAppContent（官方"广告完成→进主界面"推进方法）、
+//        adld_preloadHomeViewController、_showAppContent，以及 splashWaitSemaphore
+//        （正是 12s 等待的信号量根源）。竞品 WeiboNoAds.dylib 只过滤信息流，
+//        开屏不归它管，故不能照抄；正解是走微博自己的完成路径。
+//  本版：hook 启动页 VC WBLaunchNewViewController 的 viewDidLoad 保存活实例（__weak）；
+//        广告出现时在「活的启动页 VC」上调用 adld_advanceShowAppContent 等官方方法，
+//        主界面立即挂载，不等广告计时。保留 WBAdSdkFlashAdView 精准 fade 兜底。
+//  · 移除 v0.1.9 的 SIG 签名 dump 探针与广告 VC 上的无效 dismiss 尝试。
+//  日志仍为固定单文件覆盖写（v0.1.9 改造，用户已确认）：首行带版本+时间戳，
+//  启动时清理历史累积日志；无常驻轮询；block 用 __weak；
 //  包名不变。其他 App hook 一行未改。
 // ============================================================================
 
@@ -62,7 +61,7 @@ static BOOL splash_adblock_isWeibo(void) {
 }
 
 // ---------- 轻量日志（固定单文件覆盖写，无常驻监听、无轮询） ----------
-#define SPLASH_ADBLOCK_VERSION @"0.1.9"
+#define SPLASH_ADBLOCK_VERSION @"0.2.0"
 
 // 本次会话的唯一标志（版本号 + 启动时间戳），进程内只生成一次。
 // 日志文件名继续带标志位，沿用既有约定，便于确认是哪一版、哪一次启动。
@@ -352,72 +351,67 @@ static void splash_adblock_zhiboStartProbe(void) {
     splash_adblock_zhiboStartWindowObserver();
 }
 
-#pragma mark - 微博：提前切主界面（修复启动图等待太长，仅微博生效）
+#pragma mark - 微博：启动页 VC 提前进主界面（修复启动图长等待，仅微博生效）
 
-// v0.1.8 教训：hook -_canLoadAdNow 返回 NO 真机 hooked=0（那是信息流 selector，
-// 开屏没有类实现它）。v0.1.9 改为复刻直播吧「提前 displayRootViewController」——
-// 直播吧靠这招把主界面从广告计时结束后提前到广告出现时挂载，消除黑屏/长等待。
-//
-// 微博真机链路（v0.1.6 日志）：启动页 WBLaunchNewViewController -> level=2100
-// 广告 window(WBAdSdkNewRootViewController) -> 12s 后主 window 才切 TabBarRotateController。
-// 广告 view 已由下面的 WBAdSdkFlashAdView hook 透明化，这里再提前触发主界面挂载。
+// v0.1.9 教训：在「广告 VC」WBAdSdkNewRootViewController 上找切主界面入口无效——
+// 真机日志确认该 VC 仅 12 个生命周期方法，只命中 dismissViewControllerAnimated:，
+// 关掉广告 VC 并不会让主界面提前挂载，启动图仍等满 ~12s。
+// v0.1.9 的 [SIG] 真机日志给出正解：入口在「启动页 VC」WBLaunchNewViewController（66 方法）：
+//   · adld_advanceShowAppContent       微博官方"广告完成→进主界面"推进方法（首选）
+//   · adld_preloadHomeViewController   预加载主界面
+//   · _showAppContent                  显示主内容
+//   · splashWaitSemaphore             正是 12s 等待的信号量根源
+// 竞品 WeiboNoAds.dylib 只过滤信息流广告，开屏不归它管，故不能照抄；
+// 正解是走微博自己的完成路径（与直播吧 displayRootViewController 同构）。
 
-// 一次性签名 dump：把关键类的方法名写进日志，下一版据真实方法固化精准调用。
-// class_copyMethodList 配对 free；限次（只跑一次）、只记方法名不含编码，控制日志量。
-static void splash_adblock_weiboDumpSignatures(void) {
-    NSArray *targets = @[
-        @"WBAdSdkNewRootViewController",  // 广告 window 的 root VC（要在这里提前切主界面）
-        @"WBLaunchNewViewController",     // 启动页 VC（主 window 早期 root）
-        @"TabBarRotateController",        // 主界面 root（12s 后才挂）
-    ];
-    for (NSString *name in targets) {
-        Class c = NSClassFromString(name);
-        if (!c) {
-            splash_adblock_log([NSString stringWithFormat:@"[weibo][SIG] %@ :: NOT FOUND", name]);
-            continue;
+// 启动页 VC 活实例（__weak，不延长生命周期，随系统释放自动置 nil）。
+static __weak WBLaunchNewViewController *splash_adblock_weiboLaunchVC = nil;
+
+// 兜底：从各 window 的 rootVC / presentedVC 链里找启动页 VC 活实例。
+// 只在提前推进时调用一次（dispatch_once 内），无常驻、无轮询。
+static WBLaunchNewViewController *splash_adblock_weiboFindLaunchVC(void) {
+    WBLaunchNewViewController *saved = splash_adblock_weiboLaunchVC;
+    if (saved) return saved;
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        UIViewController *vc = w.rootViewController;
+        NSInteger depth = 0;
+        while (vc && depth < 16) { // 深度上限，防异常 presented 链死循环
+            if ([vc isKindOfClass:[WBLaunchNewViewController class]]) {
+                return (WBLaunchNewViewController *)vc;
+            }
+            vc = vc.presentedViewController;
+            depth++;
         }
-        unsigned int mc = 0;
-        Method *ms = class_copyMethodList(c, &mc);
-        NSMutableArray *sels = [NSMutableArray array];
-        for (unsigned int j = 0; j < mc; j++) {
-            [sels addObject:NSStringFromSelector(method_getName(ms[j]))];
-        }
-        if (ms) free(ms);
-        splash_adblock_log([NSString stringWithFormat:@"[weibo][SIG] %@ (%u) :: %@",
-                            name, mc, [sels componentsJoinedByString:@", "]]);
     }
+    return nil;
 }
 
-// 在「活的」广告 VC 实例上查找「切主界面」方法并调用（安全：respondsToSelector + @try）。
-// 直播吧对应方法名是 displayRootViewController；微博可能同名或近似，故列候选。
-// 必须传广告出现时的真实实例 self——新建一个实例调方法不会触发主界面切换。
-// 只做一次（dispatch_once），命中即停，不反复调用，避免干扰广告回调链。
-static void splash_adblock_weiboTryEarlyDisplay(id liveVC) {
+// 在「活的启动页 VC」上调用微博官方"提前显示主界面"方法，走它自己的完成路径，
+// 不掐广告加载/计时/回调链。dispatch_once 保证整个进程只跑一次，命中一个即停，
+// 避免重复推进干扰微博内部状态。全部 respondsToSelector + @try 保护。
+static void splash_adblock_weiboAdvanceToContent(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        // 每次启动只 dump 一次签名，供下一版固化（本版同时带自动尝试）。
-        splash_adblock_weiboDumpSignatures();
-
-        if (!liveVC) return;
-        NSArray *sels = @[@"displayRootViewController", @"displayRootView",
-                          @"showRootViewController", @"displayMainViewController",
-                          @"dismissViewControllerAnimated:completion:"];
+        WBLaunchNewViewController *launchVC = splash_adblock_weiboFindLaunchVC();
+        if (!launchVC) {
+            splash_adblock_log(@"[weibo][advance] no live launch VC, skip");
+            return;
+        }
+        // 按"最像提前进主界面"排序；均为无参 void 方法。
+        NSArray *sels = @[@"adld_advanceShowAppContent",
+                          @"_showAppContent",
+                          @"adld_preloadHomeViewController"];
         for (NSString *sn in sels) {
             SEL sel = sel_registerName([sn UTF8String]);
-            if (![liveVC respondsToSelector:sel]) continue;
+            if (![launchVC respondsToSelector:sel]) continue;
             @try {
-                if (sel == @selector(dismissViewControllerAnimated:completion:)) {
-                    [liveVC performSelector:sel withObject:@NO withObject:nil];
-                } else {
-                    [liveVC performSelector:sel];
-                }
+                [launchVC performSelector:sel];
                 splash_adblock_log([NSString stringWithFormat:
-                    @"[weibo][early] %@ %@ -> called", NSStringFromClass([liveVC class]), sn]);
+                    @"[weibo][advance] %@ -> called", sn]);
                 break; // 命中一个即停
             } @catch (NSException *e) {
                 splash_adblock_log([NSString stringWithFormat:
-                    @"[weibo][early] %@ %@ EXCEPTION %@", NSStringFromClass([liveVC class]), sn,
-                    [e reason] ?: @"?"]);
+                    @"[weibo][advance] %@ EXCEPTION %@", sn, [e reason] ?: @"?"]);
             }
         }
     });
@@ -450,18 +444,28 @@ static void splash_adblock_weiboTryEarlyDisplay(id liveVC) {
 }
 %end
 
+// 启动页 VC：保存活实例，供提前进主界面时在正确对象上调用官方推进方法。
+// 这是 v0.1.9 [SIG] 日志确认的正解对象（广告 VC 上没有切主界面方法）。
+%hook WBLaunchNewViewController
+- (void)viewDidLoad {
+    %orig;
+    if (!splash_adblock_enabled() || !splash_adblock_isWeibo()) return;
+    splash_adblock_weiboLaunchVC = self;
+    splash_adblock_log(@"[weibo][hook] WBLaunchNewViewController viewDidLoad -> saved");
+}
+%end
+
 // 微博广告 window 的 root VC。在它 viewDidAppear 时（广告 view 已出现），
-// 复刻直播吧提前切主界面：在活的广告 VC 实例上触发 App 自带的「切主界面」方法，
-// 让主界面不必等满广告计时。保留 %orig，不掐广告加载/计时/回调链。
+// 触发「提前进主界面」：在活的启动页 VC 上调用微博官方 adld_advanceShowAppContent，
+// 让主界面立即挂载，不等满广告计时。保留 %orig，不掐广告加载/计时/回调链。
 %hook WBAdSdkNewRootViewController
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
     if (!splash_adblock_enabled() || !splash_adblock_isWeibo()) return;
     splash_adblock_log(@"[weibo][hook] WBAdSdkNewRootViewController viewDidAppear");
-    __weak WBAdSdkNewRootViewController *weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.02 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        splash_adblock_weiboTryEarlyDisplay(weakSelf);
+        splash_adblock_weiboAdvanceToContent();
     });
 }
 %end
@@ -696,8 +700,9 @@ static inline double splash_adblock_zhiboElapsed(void) {
         // 清理本 App 历史日志，只保留最近 2 份（当前这份是最新的，不会被删）
         splash_adblock_pruneOldLogs();
 
-        // 直播吧：启动弹窗探针；微博：提前切主界面由 WBAdSdkNewRootViewController
-        // 的 viewDidAppear 事件驱动（不再 ctor 里枚举）。其余 App 内部门控直接返回。
+        // 直播吧：启动弹窗探针；微博：提前进主界面由广告 VC viewDidAppear 事件驱动，
+        // 在启动页 VC 上调用官方 adld_advanceShowAppContent（不再 ctor 里枚举）。
+        // 其余 App 内部门控直接返回。
         splash_adblock_zhiboStartProbe();
     }
 }

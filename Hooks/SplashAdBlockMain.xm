@@ -4,20 +4,21 @@
 #import "SplashAdBlockPrivate.h"
 
 // ============================================================================
-// 通用屏蔽插件（v0.0.9 清理版）
+// 通用屏蔽插件（v0.1.0）
 //
-// 已适配：
-//  · 掌盟 com.tencent.ied.app.lolbible —— 广点通 GDT 开屏广告（透明化方案）
+// 已精准适配（沿用 v0.0.9，逻辑一行未改）：
+//  · 掌盟 com.tencent.ied.app.lolbible —— 广点通 GDT 开屏（透明化）
 //  · 闪联 com.shanlian.pro             —— 评分弹窗
-//  · 什么值得买 com.smzdm.client.ios   —— 开屏广告（SMFullWindowAdView 精准透明化）
+//  · 什么值得买 com.smzdm.client.ios   —— SMFullWindowAdView 开屏（精准透明化）
 //
-// v0.0.9 相对 v0.0.8 的变化（只清理，不动任何屏蔽逻辑）：
-//  · 删除 smzdm 全部调试探针：SDK 类名 dump / 方法列表 dump / 视图树 dump /
-//    启动 tick 循环 / UIWindowDidBecomeVisible 常驻观察者 / VC viewDidAppear 探针
-//  · 日志从「4 路径全写」改为「App 沙盒 Documents 单写」，且只在关键事件写
-//  · 启动时自动清理本 App 旧日志，只保留最近 2 份，避免累积
-//  · /tmp 加载标记改为固定文件名覆盖写，不再每次启动生成新文件
-//  · 全程仍然只做 alpha=0，不 hidden、不移除、不掐断加载、不碰回调链
+// v0.1.0 新增：直播吧 com.zhibo8.tenyears（两个广告：打开全屏 + 进入后弹窗）
+//  按既有方法论「不猜类名、先探针」：
+//   1) 一次性探针：启动初期 dump 广告类名/方法/窗口树；弹窗侧通过 present VC /
+//      viewDidAppear / 新 window 可见通知事件驱动 dump，限次限时（120s）。
+//   2) 保守兜底：只对明确命中广告关键词的全屏 view、或高 level 独立 window
+//      做 alpha=0；不 hidden、不移除、不 dismiss、不掐断任何回调。
+//   3) 拿到日志里的真实容器类名后，下一版改成精准 hook 并移除探针。
+//  全程无常驻轮询；日志单路径 + 自动清理；包名不变。
 // ============================================================================
 
 static BOOL splash_adblock_enabled(void) {
@@ -39,8 +40,13 @@ static BOOL splash_adblock_isSmzdm(void) {
     return [b isEqualToString:@"com.smzdm.client.ios"];
 }
 
+static BOOL splash_adblock_isZhibo8(void) {
+    NSString *b = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+    return [b isEqualToString:@"com.zhibo8.tenyears"];
+}
+
 // ---------- 轻量日志（单路径 + 自动清理，无常驻监听、无轮询） ----------
-#define SPLASH_ADBLOCK_VERSION @"0.0.9"
+#define SPLASH_ADBLOCK_VERSION @"0.1.0"
 
 // 本次会话的唯一标志（版本号 + 启动时间戳），进程内只生成一次。
 // 日志文件名继续带标志位，沿用既有约定，便于确认是哪一版、哪一次启动。
@@ -60,8 +66,9 @@ static NSString *splash_adblock_logTag(void) {
     NSString *bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"unknown";
     NSArray *parts = [bundle componentsSeparatedByString:@"."];
     NSString *tag = parts.lastObject ?: bundle;
-    // 什么值得买末段是 "ios"，太通用，改用 smzdm 便于查找
+    // 什么值得买末段是 "ios"、直播吧末段是 "tenyears"，都太通用，特判便于查找
     if ([bundle isEqualToString:@"com.smzdm.client.ios"]) tag = @"smzdm";
+    if ([bundle isEqualToString:@"com.zhibo8.tenyears"]) tag = @"zhibo8";
     return tag;
 }
 
@@ -71,7 +78,7 @@ static NSString *splash_adblock_logName(void) {
             splash_adblock_logTag(), splash_adblock_runStamp()];
 }
 
-// 只写 App 沙盒 Documents（已验证三个目标 App 均可写），不再四路径全写。
+// 只写 App 沙盒 Documents（已验证目标 App 均可写），不再四路径全写。
 static NSString *splash_adblock_logPath(void) {
     NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
     NSString *dir = docs.firstObject ?: @"/tmp";
@@ -188,6 +195,203 @@ static BOOL splash_adblock_viewLooksLikeRating(UIView *view, NSString **matchedT
     return NO;
 }
 
+#pragma mark - 直播吧：开屏 + 弹窗 探针与保守兜底（仅直播吧生效）
+
+static NSTimeInterval splash_adblock_zhiboLaunchTime = 0;
+static NSInteger splash_adblock_zhiboPresentCount = 0;
+static NSInteger splash_adblock_zhiboVCCount = 0;
+static NSInteger splash_adblock_zhiboWindowCount = 0;
+static id splash_adblock_zhiboWindowObserver = nil;
+
+// 探针/兜底只在启动后 120s 内有效：开屏在早期，弹窗可能延后，但不长期驻留。
+static BOOL splash_adblock_zhiboProbeActive(void) {
+    if (!splash_adblock_enabled() || !splash_adblock_isZhibo8()) return NO;
+    NSTimeInterval elapsed = [[NSDate date] timeIntervalSince1970] - splash_adblock_zhiboLaunchTime;
+    return elapsed >= 0 && elapsed <= 120;
+}
+
+// 广告类名关键词：国内常见广告 SDK + 中文语义 + 弹窗语义。
+// 不含裸 "ad"，避免误伤 Navigation/TabBar 等正常类。
+static BOOL splash_adblock_zhiboNameLooksLikeAd(NSString *name) {
+    if (!name || name.length == 0) return NO;
+    NSString *lower = [name lowercaseString];
+    NSArray *keys = @[@"splash", @"launchad", @"openscreen", @"openads", @"flashad",
+                      @"startupad", @"splashad", @"全屏广告", @"开屏", @"广告", @"弹窗",
+                      @"abu", @"csj", @"pangle", @"jgads", @"busplash", @"gdt",
+                      @"ksad", @"sigmob", @"interstitial", @"adview", @"adbanner", @"popup"];
+    for (NSString *k in keys) {
+        if ([lower rangeOfString:k].location != NSNotFound) return YES;
+    }
+    return NO;
+}
+
+// 有限深度、有限行数的视图树 dump，避免日志爆炸。
+static void splash_adblock_zhiboDumpTree(UIView *v, NSInteger depth, NSMutableString *out, NSInteger *lines) {
+    if (!v || depth > 6 || *lines > 140) return;
+    CGRect f = v.frame;
+    NSString *pad = [@"" stringByPaddingToLength:depth * 2 withString:@" " startingAtIndex:0];
+    [out appendFormat:@"%@%@ (%.0f,%.0f %.0fx%.0f) a=%.2f h=%d\n", pad,
+        NSStringFromClass([v class]), f.origin.x, f.origin.y, f.size.width, f.size.height,
+        v.alpha, v.hidden];
+    (*lines)++;
+    for (UIView *sub in v.subviews) splash_adblock_zhiboDumpTree(sub, depth + 1, out, lines);
+}
+
+static void splash_adblock_zhiboDumpWindows(NSString *when) {
+    NSInteger lines = 0;
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        NSMutableString *out = [NSMutableString stringWithFormat:
+            @"[zhibo][tree@%@] WINDOW level=%.0f root=%@ bounds=%@\n",
+            when, w.windowLevel, NSStringFromClass([w.rootViewController class]), NSStringFromCGRect(w.bounds)];
+        lines++;
+        for (UIView *v in w.subviews) splash_adblock_zhiboDumpTree(v, 0, out, &lines);
+        splash_adblock_log(out);
+    }
+}
+
+static void splash_adblock_zhiboDumpClasses(void) {
+    NSArray *keys = @[@"splash", @"launchAd", @"OpenScreen", @"开屏", @"广告", @"弹窗",
+                      @"ABU", @"BUSplash", @"JgAds", @"GDT", @"KSAd", @"Sigmob",
+                      @"SplashAd", @"SplashView", @"AdView", @"Interstitial", @"Popup"];
+    NSMutableArray *hits = [NSMutableArray array];
+    unsigned int count = 0;
+    Class *classes = objc_copyClassList(&count);
+    if (classes) {
+        for (unsigned int i = 0; i < count; i++) {
+            NSString *name = NSStringFromClass(classes[i]);
+            for (NSString *k in keys) {
+                if ([name rangeOfString:k options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                    [hits addObject:name];
+                    break;
+                }
+            }
+        }
+        free(classes);
+    }
+    splash_adblock_log([NSString stringWithFormat:@"[zhibo][classes] ad-like=%lu", (unsigned long)hits.count]);
+    NSUInteger lim = MIN(hits.count, 120);
+    for (NSUInteger i = 0; i < lim; i++) {
+        splash_adblock_log([NSString stringWithFormat:@"   %@", hits[i]]);
+    }
+}
+
+static void splash_adblock_zhiboDumpMethods(void) {
+    NSMutableArray *targets = [NSMutableArray array];
+    unsigned int count = 0;
+    Class *classes = objc_copyClassList(&count);
+    if (classes) {
+        for (unsigned int i = 0; i < count; i++) {
+            NSString *name = NSStringFromClass(classes[i]);
+            if (splash_adblock_zhiboNameLooksLikeAd(name)) [targets addObject:name];
+        }
+        free(classes);
+    }
+    NSUInteger lim = MIN(targets.count, 40);
+    splash_adblock_log([NSString stringWithFormat:@"[zhibo][methods] ad-like classes=%lu (dump %lu)",
+                        (unsigned long)targets.count, (unsigned long)lim]);
+    for (NSUInteger i = 0; i < lim; i++) {
+        NSString *n = targets[i];
+        Class c = NSClassFromString(n);
+        if (!c) continue;
+        unsigned int mc = 0;
+        Method *ms = class_copyMethodList(c, &mc);
+        NSMutableArray *sels = [NSMutableArray array];
+        for (unsigned int j = 0; j < mc; j++) {
+            [sels addObject:NSStringFromSelector(method_getName(ms[j]))];
+        }
+        if (ms) free(ms);
+        splash_adblock_log([NSString stringWithFormat:@"[CLASS] %@ :: %@", n,
+                            [sels componentsJoinedByString:@", "]]);
+    }
+}
+
+// 只对「命中广告类名 + 接近全屏」的 view 做 alpha=0，跳过 root view，不碰主界面。
+static void splash_adblock_zhiboFadeRecursive(UIView *v, UIWindow *win, BOOL isRoot) {
+    if (!v || isRoot) return;
+    NSString *cls = NSStringFromClass([v class]);
+    CGRect f = v.frame;
+    CGSize s = win.bounds.size;
+    BOOL fullscreen = s.width > 0 && f.size.width >= s.width * 0.8
+                      && f.size.height >= s.height * 0.5;
+    if (fullscreen && splash_adblock_zhiboNameLooksLikeAd(cls)) {
+        splash_adblock_log([NSString stringWithFormat:@"[zhibo][MATCH] ad view %@ frame=%@ -> fade",
+                            cls, NSStringFromCGRect(f)]);
+        splash_adblock_fadeTree(v);
+    }
+    BOOL childIsRoot = [v isEqual:win.rootViewController.view];
+    for (UIView *sub in v.subviews) splash_adblock_zhiboFadeRecursive(sub, win, childIsRoot);
+}
+
+static void splash_adblock_zhiboFadeFullscreenAds(void) {
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        // 高 level 独立 window：开屏/弹窗常见形态，整棵透明化（不动 window 本身）。
+        CGFloat level = w.windowLevel;
+        if (level > 100 && level < 3000) {
+            splash_adblock_log([NSString stringWithFormat:@"[zhibo][MATCH] high-level window level=%.0f root=%@ -> fade",
+                                level, NSStringFromClass([w.rootViewController class])]);
+            splash_adblock_fadeTree(w);
+            continue;
+        }
+        for (UIView *v in w.subviews) {
+            splash_adblock_zhiboFadeRecursive(v, w, [v isEqual:w.rootViewController.view]);
+        }
+    }
+}
+
+// 新 window 出现事件：抓弹窗最常见形态；限 12 次，120s 后自动移除观察者。
+static void splash_adblock_zhiboStartWindowObserver(void) {
+    splash_adblock_zhiboWindowObserver =
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIWindowDidBecomeVisibleNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(NSNotification *note) {
+        if (!splash_adblock_zhiboProbeActive()) return;
+        if (splash_adblock_zhiboWindowCount >= 12) return;
+        splash_adblock_zhiboWindowCount++;
+        UIWindow *w = note.object;
+        if (![w isKindOfClass:[UIWindow class]]) return;
+        splash_adblock_log([NSString stringWithFormat:@"[zhibo][window#%ld] level=%.0f root=%@",
+                            (long)splash_adblock_zhiboWindowCount, w.windowLevel,
+                            NSStringFromClass([w.rootViewController class])]);
+        NSInteger lines = 0;
+        NSMutableString *out = [NSMutableString string];
+        for (UIView *v in w.subviews) splash_adblock_zhiboDumpTree(v, 0, out, &lines);
+        splash_adblock_log(out);
+        if (w.windowLevel > 100 && w.windowLevel < 3000) {
+            splash_adblock_log(@"[zhibo][MATCH] high-level window -> fade");
+            splash_adblock_fadeTree(w);
+        }
+    }];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(120 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (splash_adblock_zhiboWindowObserver) {
+            [[NSNotificationCenter defaultCenter] removeObserver:splash_adblock_zhiboWindowObserver];
+            splash_adblock_zhiboWindowObserver = nil;
+            splash_adblock_log(@"[zhibo] window observer removed");
+        }
+    });
+}
+
+// 一次性探针入口：类名/方法各 dump 一次；视图树用递减频率的有限次 tick
+// 覆盖到 75s（为了抓「进去之后的弹窗」），不是常驻轮询。
+static void splash_adblock_zhiboStartProbe(void) {
+    if (!splash_adblock_enabled() || !splash_adblock_isZhibo8()) return;
+    splash_adblock_zhiboLaunchTime = [[NSDate date] timeIntervalSince1970];
+    splash_adblock_log(@"[zhibo] === probe start: splash + popup ===");
+    splash_adblock_zhiboDumpClasses();
+    splash_adblock_zhiboDumpMethods();
+    NSArray *ticks = @[@0.5, @1.5, @3.0, @6.0, @12.0, @25.0, @45.0, @75.0];
+    for (NSNumber *t in ticks) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(t.doubleValue * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (!splash_adblock_zhiboProbeActive()) return;
+            splash_adblock_zhiboFadeFullscreenAds();
+            splash_adblock_zhiboDumpWindows([NSString stringWithFormat:@"%.1fs", t.doubleValue]);
+        });
+    }
+    splash_adblock_zhiboStartWindowObserver();
+}
+
 #pragma mark - 掌盟开屏（仅掌盟生效）
 
 %hook TGGDTSplashViewController
@@ -251,34 +455,87 @@ static BOOL splash_adblock_viewLooksLikeRating(UIView *view, NSString **matchedT
 }
 %end
 
-#pragma mark - 闪联评分弹窗（仅闪联生效，事件驱动）
+#pragma mark - 全局 VC hook（闪联评分弹窗 + 直播吧弹窗探针）
 
 %hook UIViewController
 - (void)presentViewController:(UIViewController *)vc animated:(BOOL)animated completion:(void (^)(void))completion {
     %orig;
 
-    if (!splash_adblock_enabled() || !splash_adblock_isShanlian()) return;
-    if (!vc) return;
+    if (!splash_adblock_enabled()) return;
 
-    NSString *vcName = NSStringFromClass([vc class]);
-    NSString *title = vc.title;
-    NSString *msg = [vc isKindOfClass:[UIAlertController class]] ? ((UIAlertController *)vc).message : nil;
-    NSString *matched = nil;
-    BOOL hit = splash_adblock_textLooksLikeRating(title)
-            || splash_adblock_textLooksLikeRating(msg)
-            || splash_adblock_viewLooksLikeRating(vc.view, &matched);
-    if (hit) {
-        splash_adblock_log([NSString stringWithFormat:@"[MATCH] rating popup VC=%@ matched='%@'",
-                            vcName, matched ?: (title ?: (msg ?: @""))]);
-        __weak UIViewController *weakVC = vc;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.02 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            UIViewController *strongVC = weakVC;
-            if (!strongVC) return;
-            splash_adblock_fadeTree(strongVC.view);
-            [strongVC dismissViewControllerAnimated:NO completion:nil];
-            splash_adblock_log(@"[closed] rating popup dismissed");
-        });
+    // ---- 闪联评分弹窗 ----
+    if (splash_adblock_isShanlian()) {
+        if (!vc) return;
+        NSString *vcName = NSStringFromClass([vc class]);
+        NSString *title = vc.title;
+        NSString *msg = [vc isKindOfClass:[UIAlertController class]] ? ((UIAlertController *)vc).message : nil;
+        NSString *matched = nil;
+        BOOL hit = splash_adblock_textLooksLikeRating(title)
+                || splash_adblock_textLooksLikeRating(msg)
+                || splash_adblock_viewLooksLikeRating(vc.view, &matched);
+        if (hit) {
+            splash_adblock_log([NSString stringWithFormat:@"[MATCH] rating popup VC=%@ matched='%@'",
+                                vcName, matched ?: (title ?: (msg ?: @""))]);
+            __weak UIViewController *weakVC = vc;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.02 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                UIViewController *strongVC = weakVC;
+                if (!strongVC) return;
+                splash_adblock_fadeTree(strongVC.view);
+                [strongVC dismissViewControllerAnimated:NO completion:nil];
+                splash_adblock_log(@"[closed] rating popup dismissed");
+            });
+        }
+    }
+
+    // ---- 直播吧：弹窗探针（事件驱动、限 15 次、120s 内） ----
+    if (splash_adblock_isZhibo8() && vc && splash_adblock_zhiboProbeActive()
+        && splash_adblock_zhiboPresentCount < 15) {
+        splash_adblock_zhiboPresentCount++;
+        NSString *vcName = NSStringFromClass([vc class]);
+        NSString *title = vc.title;
+        NSString *msg = [vc isKindOfClass:[UIAlertController class]] ? ((UIAlertController *)vc).message : nil;
+        splash_adblock_log([NSString stringWithFormat:@"[zhibo][present] VC=%@ title=%@ msg=%@",
+                            vcName, title ?: @"", msg ?: @""]);
+        NSInteger lines = 0;
+        NSMutableString *out = [NSMutableString string];
+        splash_adblock_zhiboDumpTree(vc.view, 0, out, &lines);
+        splash_adblock_log(out);
+        if (splash_adblock_zhiboNameLooksLikeAd(vcName)) {
+            splash_adblock_log([NSString stringWithFormat:@"[zhibo][MATCH] ad-like popup VC=%@ -> fade", vcName]);
+            __weak UIViewController *weakVC = vc;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.02 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                UIViewController *strongVC = weakVC;
+                if (!strongVC || !splash_adblock_zhiboProbeActive()) return;
+                splash_adblock_fadeTree(strongVC.view);
+            });
+        }
+    }
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    %orig;
+
+    if (!splash_adblock_zhiboProbeActive()) return;
+    if (splash_adblock_zhiboVCCount >= 60) return;
+    splash_adblock_zhiboVCCount++;
+    NSString *cls = NSStringFromClass([self class]);
+    CGFloat level = self.view.window ? self.view.window.windowLevel : -1;
+    splash_adblock_log([NSString stringWithFormat:@"[zhibo][vc] VC=%@ level=%.0f", cls, level]);
+
+    // 命中开屏特征 VC -> 事件驱动兜底（一次性延迟补刀，非轮询）
+    if (splash_adblock_zhiboNameLooksLikeAd(cls)) {
+        splash_adblock_log([NSString stringWithFormat:@"[zhibo][MATCH] ad-like VC=%@ -> fade", cls]);
+        __weak UIViewController *weakSelf = self;
+        for (NSNumber *d in @[@0.02, @0.2, @0.7]) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                UIViewController *strongSelf = weakSelf;
+                if (!strongSelf || !splash_adblock_zhiboProbeActive()) return;
+                splash_adblock_fadeTree(strongSelf.view);
+            });
+        }
     }
 }
 %end
@@ -295,5 +552,8 @@ static BOOL splash_adblock_viewLooksLikeRating(UIView *view, NSString **matchedT
 
         // 清理本 App 历史日志，只保留最近 2 份（当前这份是最新的，不会被删）
         splash_adblock_pruneOldLogs();
+
+        // 直播吧：启动双探针（开屏 + 弹窗），其他 App 直接返回
+        splash_adblock_zhiboStartProbe();
     }
 }

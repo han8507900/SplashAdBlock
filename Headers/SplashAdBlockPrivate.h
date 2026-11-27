@@ -54,6 +54,12 @@
 - (void)setHidden:(BOOL)hidden;
 @end
 
+// 广告 window(level=2100) 的 root VC，广告出现时在此提前切主界面。
+@interface WBAdSdkNewRootViewController : UIViewController
+- (void)viewDidAppear:(BOOL)animated;
+- (void)displayRootViewController;
+@end
+
 // -------- 评分弹窗 --------
 // 系统原生评分控制器（iOS 10.3+）。前向声明避免依赖 StoreKit 框架。
 @interface SKStoreReviewController : NSObject

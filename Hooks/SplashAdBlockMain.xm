@@ -4,7 +4,7 @@
 #import "SplashAdBlockPrivate.h"
 
 // ============================================================================
-// 通用屏蔽插件（v0.3.4）
+// 通用屏蔽插件（v0.3.5）
 //
 // 已精准适配（屏蔽逻辑一行未改）：
 //  · 掌盟 com.tencent.ied.app.lolbible —— 广点通 GDT 开屏（透明化）
@@ -18,7 +18,13 @@
 //                                        （竞品逆向，已真机验证定版）
 //  · 铁路12306 cn.12306.rails12306     —— 吞两个数据注入 setter（竞品逆向，已定版）
 //  · 下厨房 com.xiachufang.recipe      —— 揭启动占位窗口 + 倍孜广告 VC 透明 + 启动期
-//                                        拦 openURL 防摇一摇跳转
+//                                        拦 openURL 防摇一摇跳转（v0.3.4 真机验证定版）
+//
+// v0.3.5（定版收尾版，无功能改动）：
+//  · 用户真机确认 v0.3.4 下厨房"可以了" → 按约定移出诊断日志白名单。
+//  · 日志开关改为全局 NO：所有 App 每次启动不再生成任何日志文件；启动时
+//    pruneOldLogs 会删除本插件残留的全部 .log（含诊断期留下的
+//    SplashAdBlock_xiachufang.log），手机上不留垃圾。屏蔽逻辑一行未改。
 //
 // v0.3.4 下厨房修正（v0.3.3 真机反馈：启动屏变长 + 仍有广告）：
 //  · 教训：v0.3.3 吞 BeiZi_loadSplashAd 后 SDK 不再回调，下厨房的
@@ -84,15 +90,15 @@ static BOOL splash_adblock_isXiachufang(void) {
 }
 
 // ---------- 轻量日志（按需开关，无常驻监听、无轮询） ----------
-#define SPLASH_ADBLOCK_VERSION @"0.3.4"
+#define SPLASH_ADBLOCK_VERSION @"0.3.5"
 
-// v0.3.2：日志默认关闭——已定版 App 每次启动不再生成任何日志文件。
-// 只有"诊断中"的新接入 App 才写日志（真机验证 hook 命中用），定版后从白名单移除。
-// 变更记录：v0.3.1 铁路12306 已验证定版，移出白名单；
-// 当前诊断白名单：下厨房（新接入，待验证）。其余 App 一律不写日志。
+// 日志默认关闭：所有 App 均已定版，每次启动不再生成任何日志文件。
+// 接入新 App 做诊断时，这里临时 `return [bundle isEqualToString:@"<新 bundle>"];`，
+// 真机验证通过后**下一版必须改回 NO**（用户要求：定版 App 一律不写日志）。
+// 变更记录：百度地图 v0.3.0 诊断→v0.3.1 定版；12306 v0.3.1 诊断→v0.3.2 定版；
+//          下厨房 v0.3.2~v0.3.4 诊断→v0.3.5 定版，白名单清空。
 static BOOL splash_adblock_logEnabled(void) {
-    NSString *bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
-    return [bundle isEqualToString:@"com.xiachufang.recipe"];
+    return NO;
 }
 
 // 本次会话的唯一标志（版本号 + 启动时间戳），进程内只生成一次。
@@ -402,7 +408,7 @@ static void splash_adblock_zhiboStartProbe(void) {
 //  v0.3.3（吞加载）：吞 BeiZi_loadSplashAd 后 SDK 不回任何回调，占位窗口没人来关，
 //    → 启动屏时间反而变长；同时撤掉了窗口级兜底，启动海报重新可见（用户看到"还有广告"）。
 //    教训：这里不能"掐断加载让 SDK 沉默"，必须让它走完整回调链。
-//  v0.3.4（本版）正解三步，全部是"走 App/SDK 自己的路径"，不掐断任何回调：
+//  v0.3.4 起的正解四步，全部是"走 App/SDK 自己的路径"，不掐断任何回调（v0.3.5 定版沿用）：
 //    ① BeiZi_loadSplashAd 恢复 %orig：SDK 正常加载/计时/回调，占位窗口按时关闭→启动不变长。
 //    ② runtime hook recipe.LaunchScreenPlaceholderVC 的 viewDidAppear:：确认主界面
 //       window 已可见后，把该占位窗口 alpha=0（不 hidden、不移除），主界面立刻透出

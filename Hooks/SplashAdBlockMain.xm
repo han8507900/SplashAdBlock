@@ -1287,7 +1287,7 @@ static void splash_adblock_wpStartProtection(void) {
     if (!splash_adblock_wpActive()) return;
     splash_adblock_wpShieldUntil = [[NSDate date] timeIntervalSince1970] + 15.0;
     splash_adblock_wpLaunchTime = [[NSDate date] timeIntervalSince1970];
-    splash_adblock_log(@@"[wp] active: ad-only sweep + recover + block store page/openURL 15s");
+    splash_adblock_log(@"[wp] active: ad-only sweep + recover + block store page/openURL 15s");
     splash_adblock_wpScheduleSweeps();
 }
 

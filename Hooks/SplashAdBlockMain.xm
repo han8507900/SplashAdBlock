@@ -1090,6 +1090,8 @@ static NSInteger splash_adblock_wpSweep(NSString *why) {
         if (w.windowLevel > 100) continue;                // 键盘/状态栏/系统弹层不碰
         BOOL isMain = (w == main);
         UIView *rootView = w.rootViewController.view;
+        // 主窗口视图还没就绪时一律不动：此时 isAncestorOfRoot 判不出来，fade 会误伤内容容器。
+        if (isMain && !rootView) continue;
         if (!isMain) {
             BOOL adWin = splash_adblock_wpWindowIsAdHost(w);
             if (!adWin) {

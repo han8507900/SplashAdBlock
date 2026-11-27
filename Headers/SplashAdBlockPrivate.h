@@ -36,11 +36,13 @@
 - (void)setHidden:(BOOL)hidden;
 @end
 
-// 开屏 VC（v0.1.2 生命周期探针用，前向声明，不改行为）
+// 开屏 VC（生命周期探针 + v0.1.3 提前显示主界面）
+// displayRootViewController：v0.1.2 [SIG] 确认存在，无参 void，App 自带"切到主界面"方法。
 @interface ZBSplashAdViewController : UIViewController
 - (void)viewDidLoad;
 - (void)viewDidAppear:(BOOL)animated;
 - (void)viewWillDisappear:(BOOL)animated;
+- (void)displayRootViewController;
 @end
 
 // -------- 评分弹窗 --------

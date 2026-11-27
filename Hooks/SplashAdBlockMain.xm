@@ -506,7 +506,8 @@ static void splash_adblock_xcfInstallPlaceholderHook(void) {
         return;
     }
     if (!splash_adblock_xcfPlaceholderOrigDidAppear) {
-        splash_adblock_xcfPlaceholderOrigDidAppear = (void *)method_getImplementation(m);
+        // ARC 下不允许 void* 直接赋给函数指针，用指针别名接住原 IMP。
+        *(void **)(&splash_adblock_xcfPlaceholderOrigDidAppear) = (void *)method_getImplementation(m);
         method_setImplementation(m, (IMP)splash_adblock_xcfPlaceholderDidAppear);
         splash_adblock_log(@"[xcf][hook] LaunchScreenPlaceholderVC viewDidAppear: hooked");
     }

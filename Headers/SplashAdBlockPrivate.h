@@ -84,6 +84,22 @@
 - (void)setMaterialsList:(id)list;
 @end
 
+// -------- 下厨房开屏（倍孜 BeiZi SDK，真机 v0.3.2 日志确认）--------
+// 真机日志：开屏 VC = BeiZiSplashImageViewController（level=1999 window），
+// 广告 SDK = 倍孜 BeiZiSDK。摇一摇跳转由 SDK 传感器驱动，view 透明化无法阻止。
+// BeiZiSplash 的 -BeiZi_loadSplashAd 是开屏加载入口；吞掉它让 SDK 不创建开屏对象，
+// 从根源杜绝广告 view + 摇一摇传感器。下厨房是"先进主页后异步弹广告"模式
+// （日志 window#1 已是主界面 XCFTabbarViewController），不加载不卡启动。
+@interface BeiZiSplash : NSObject
+- (void)BeiZi_loadSplashAd;
+- (void)BeiZi_removeSplashAd;
+@end
+
+@interface BeiZiSplashImageViewController : UIViewController
+- (void)viewDidAppear:(BOOL)animated;
+- (void)viewDidLayoutSubviews;
+@end
+
 // -------- 评分弹窗 --------
 // 系统原生评分控制器（iOS 10.3+）。前向声明避免依赖 StoreKit 框架。
 @interface SKStoreReviewController : NSObject

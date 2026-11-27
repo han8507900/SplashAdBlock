@@ -2,17 +2,17 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Filter</key>
-    <dict>
-        <key>Bundles</key>
-        <!-- 目标 App 列表：新增 App 时，把它的 Bundle ID 另起一行加进本数组 -->
-        <array>
-            <string>com.tencent.ied.app.lolbible</string>
-            <string>com.shanlian.pro</string>
-            <string>com.smzdm.client.ios</string>
-            <string>com.zhibo8.tenyears</string>
-            <string>com.sina.weibo</string>
-        </array>
-    </dict>
+	<key>Filter</key>
+	<dict>
+		<key>Bundles</key>
+		<array>
+			<string>com.tencent.ied.app.lolbible</string>
+			<string>com.shanlian.pro</string>
+			<string>com.smzdm.client.ios</string>
+			<string>com.zhibo8.tenyears</string>
+			<string>com.sina.weibo</string>
+			<string>com.baidu.map</string>
+		</array>
+	</dict>
 </dict>
 </plist>

@@ -4,7 +4,7 @@
 #import "SplashAdBlockPrivate.h"
 
 // ============================================================================
-// 通用屏蔽插件（v0.5.0）
+// 通用屏蔽插件（v0.5.1）
 //
 // 已精准适配（屏蔽逻辑一行未改）：
 //  · 掌盟 com.tencent.ied.app.lolbible —— 广点通 GDT 开屏（透明化）
@@ -22,7 +22,12 @@
 //  · 威锋   com.feng.New.WPForumClient —— 优量汇 GDT 开屏：广告层**沉到窗口最底层**被主界面
 //                                        容器挡住（不动 alpha，保住曝光判定）+ tick 兜底
 //                                        + 断言覆盖式全屏 + 走"跳过"dismiss
-//                                        + 启动期 openURL/App Store 页拦截
+//                                        + 启动期 openURL/App Store 页拦截（v0.5.1 定版）
+//
+// v0.5.1 定版（v0.5.0 真机确认"可以了"）：
+//  · 威锋移出日志白名单（logEnabled 直接 return NO），启动清空沙盒内历史日志；
+//  · 摘掉这轮定位用的取证探针：`[wp][tX] hits=... subs=[...]`（含 wpSubsSummary）、
+//    `[wp][present#N] VC=...` 逐 VC 日志 —— 按项目铁律，探针不能留着每次启动照跑。
 //
 // v0.5.0 威锋修正（v0.4.9 真机反馈："黑屏了，而且进不去主页面"）：
 //  · v0.4.9 日志关键点：
@@ -255,15 +260,14 @@ static BOOL splash_adblock_isWPForum(void) {
 }
 
 // ---------- 轻量日志（按需开关，无常驻监听、无轮询） ----------
-#define SPLASH_ADBLOCK_VERSION @"0.5.0"
+#define SPLASH_ADBLOCK_VERSION @"0.5.1"
 
 // 日志默认关闭：已定版 App 每次启动不再生成任何日志文件。
 // 接入新 App 做诊断时，这里临时指向它的 bundle，真机验证通过后**下一版必须改回 NO**。
 // 变更记录：百度地图 v0.3.0 诊断→v0.3.1 定版；12306 v0.3.1 诊断→v0.3.2 定版；
-//          下厨房 v0.3.2~v0.3.4 诊断→v0.3.5 定版；威锋 v0.4.0~v0.5.0 诊断中。
+//          下厨房 v0.3.2~v0.3.4 诊断→v0.3.5 定版；威锋 v0.4.0~v0.5.0 诊断→v0.5.1 定版。
 static BOOL splash_adblock_logEnabled(void) {
-    NSString *bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
-    return [bundle isEqualToString:@"com.feng.New.WPForumClient"];
+    return NO;
 }
 
 // 本次会话的唯一标志（版本号 + 启动时间戳），进程内只生成一次。
@@ -825,13 +829,13 @@ static void splash_adblock_wpRevealLaunchWindow(void) {
 // ---- 开屏层处理（v0.4.2：透明化 + 走 SDK 自己的"跳过"路径 dismiss） ----
 
 static NSTimeInterval splash_adblock_wpLaunchTime = 0;
-static NSInteger splash_adblock_wpVCCount = 0;
 
 static BOOL splash_adblock_wpActive(void) {
     return splash_adblock_enabled() && splash_adblock_isWPForum();
 }
 
-// 诊断日志窗口：启动后 30s 内记录（时间戳比较，无定时器、无轮询）。
+// 启动期窗口：启动后 30s 内（时间戳比较，无定时器、无轮询）。
+// 既是日志门控，也是"开屏 VC 命中就 dismiss"这一动作的有效范围。
 static BOOL splash_adblock_wpProbeActive(void) {
     if (!splash_adblock_wpActive()) return NO;
     NSTimeInterval elapsed = [[NSDate date] timeIntervalSince1970] - splash_adblock_wpLaunchTime;
@@ -940,21 +944,6 @@ static BOOL splash_adblock_wpIsAncestorOfRoot(UIView *v, UIView *rootView) {
     if (!v || !rootView) return NO;
     if (v == rootView) return YES;
     return [rootView isDescendantOfView:v];
-}
-
-// 窗口直接子视图摘要（一行看清上面压了哪几层、谁是 root）。
-static NSString *splash_adblock_wpSubsSummary(UIWindow *w, UIView *rootView) {
-    NSMutableString *s = [NSMutableString string];
-    CGSize ws = w.bounds.size;
-    for (UIView *sub in w.subviews) {
-        CGSize fs = sub.frame.size;
-        BOOL full = ws.width > 0 && fs.width >= ws.width * 0.9 && fs.height >= ws.height * 0.9;
-        [s appendFormat:@"%@(%.0fx%.0f a%.2f%@)%@ ", NSStringFromClass([sub class]),
-            fs.width, fs.height, sub.alpha, full ? @",full" : @"",
-            (rootView && sub == rootView) ? @"*root" : @""];
-        if (s.length > 480) { [s appendString:@"..."]; break; }
-    }
-    return s.length ? s : @"(empty)";
 }
 
 // ---- 带记账的 fade：只动 alpha，可撤销 ----
@@ -1277,15 +1266,6 @@ static NSInteger splash_adblock_wpSweep(NSString *why) {
     }
     // 不管上面清了几层，都要确认主界面真的在看得见的位置。
     if (main) (void)splash_adblock_wpRecoverMain(main, why);
-    if (main && splash_adblock_wpProbeActive()) {
-        UIView *rv = main.rootViewController.view;
-        splash_adblock_log([NSString stringWithFormat:
-            @"[wp][%@] hits=%ld key=%d rootInWin=%d rootA=%.2f wins=%lu subs=[%@]",
-            why, (long)hits, main.isKeyWindow ? 1 : 0,
-            splash_adblock_wpRootInWindow(main) ? 1 : 0, rv.alpha,
-            (unsigned long)[UIApplication sharedApplication].windows.count,
-            splash_adblock_wpSubsSummary(main, rv)]);
-    }
     return hits;
 }
 
@@ -1870,12 +1850,8 @@ static inline double splash_adblock_zhiboElapsed(void) {
     }
 
     // ---- 威锋：开屏 VC 一 present 就透明化 + dismiss（GDT 全屏 present，见下方说明） ----
-    if (splash_adblock_wpActive() && vc && splash_adblock_wpProbeActive()
-        && splash_adblock_wpVCCount < 40) {
-        splash_adblock_wpVCCount++;
+    if (splash_adblock_wpActive() && vc && splash_adblock_wpProbeActive()) {
         NSString *vcName = NSStringFromClass([vc class]);
-        splash_adblock_log([NSString stringWithFormat:@"[wp][present#%ld] VC=%@",
-                            (long)splash_adblock_wpVCCount, vcName]);
         if (splash_adblock_wpLooksLikeSplash(vcName)) {
             splash_adblock_wpHandleSplashVC(vc, @"present");
         }

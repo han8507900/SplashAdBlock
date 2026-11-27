@@ -4,7 +4,7 @@
 #import "SplashAdBlockPrivate.h"
 
 // ============================================================================
-// 通用屏蔽插件（v0.2.0）
+// 通用屏蔽插件（v0.3.0）
 //
 // 已精准适配（屏蔽逻辑一行未改）：
 //  · 掌盟 com.tencent.ied.app.lolbible —— 广点通 GDT 开屏（透明化）
@@ -12,23 +12,19 @@
 //  · 什么值得买 com.smzdm.client.ios   —— SMFullWindowAdView 开屏（精准透明化）
 //  · 直播吧 com.zhibo8.tenyears        —— ZBSplashView 开屏（精准透明化）
 //                                        + 提前 displayRootViewController 消黑屏
+//  · 微博   com.sina.weibo             —— 启动页 VC 提前 adld_advanceShowAppContent
+//                                        + WBAdSdkFlashAdView 精准 fade（已定版）
 //
-// v0.2.0 微博启动图长等待修复（相对 v0.1.9）：
-//  背景：v0.1.9 在「广告 VC」WBAdSdkNewRootViewController 上找切主界面入口，
-//        真机日志证实该 VC 仅有 12 个生命周期方法，只命中无效的
-//        dismissViewControllerAnimated:（关广告 VC 不切主界面），启动图仍等满 ~12s。
-//        v0.1.9 的 [SIG] 日志给出正解：启动页 VC WBLaunchNewViewController（66 方法）
-//        自带 adld_advanceShowAppContent（官方"广告完成→进主界面"推进方法）、
-//        adld_preloadHomeViewController、_showAppContent，以及 splashWaitSemaphore
-//        （正是 12s 等待的信号量根源）。竞品 WeiboNoAds.dylib 只过滤信息流，
-//        开屏不归它管，故不能照抄；正解是走微博自己的完成路径。
-//  本版：hook 启动页 VC WBLaunchNewViewController 的 viewDidLoad 保存活实例（__weak）；
-//        广告出现时在「活的启动页 VC」上调用 adld_advanceShowAppContent 等官方方法，
-//        主界面立即挂载，不等广告计时。保留 WBAdSdkFlashAdView 精准 fade 兜底。
-//  · 移除 v0.1.9 的 SIG 签名 dump 探针与广告 VC 上的无效 dismiss 尝试。
-//  日志仍为固定单文件覆盖写（v0.1.9 改造，用户已确认）：首行带版本+时间戳，
-//  启动时清理历史累积日志；无常驻轮询；block 用 __weak；
-//  包名不变。其他 App hook 一行未改。
+// v0.3.0 新增百度地图 + 日志改造：
+//  · 百度地图 com.baidu.map：学习竞品「广告终结者」百度地图.dylib——hook
+//    BMSplashMaterialManager 的 -isSplashShowClosed 返回 YES，让百度认为开屏已展示过，
+//    走正常"无开屏"路径直接进主界面。这是 App 设计内的状态查询，不改广告加载/计时/
+//    回调链，符合"绝不掐断回调"约定。仅加开屏这一项，信息流广告暂不动（一次一个 App）。
+//  · 日志改造（用户要求"取消每次打开生成日志，后续每个 App 同样处理"）：
+//    新增 splash_adblock_logEnabled 开关——已定版 App 一律不写日志文件，启动时清理
+//    历史残留；仅"诊断中"新接入 App（当前=百度地图）写日志供真机验证，定版后移出白名单。
+//    /tmp 加载标记固定名覆盖写（非 .log、不累积），保留用于确认注入成功。
+//  无常驻轮询；block 用 __weak；包名不变。其他 App hook 一行未改。
 // ============================================================================
 
 static BOOL splash_adblock_enabled(void) {
@@ -60,8 +56,21 @@ static BOOL splash_adblock_isWeibo(void) {
     return [b isEqualToString:@"com.sina.weibo"];
 }
 
-// ---------- 轻量日志（固定单文件覆盖写，无常驻监听、无轮询） ----------
-#define SPLASH_ADBLOCK_VERSION @"0.2.0"
+static BOOL splash_adblock_isBaiduMap(void) {
+    NSString *b = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+    return [b isEqualToString:@"com.baidu.map"];
+}
+
+// ---------- 轻量日志（按需开关，无常驻监听、无轮询） ----------
+#define SPLASH_ADBLOCK_VERSION @"0.3.0"
+
+// v0.3.0：日志默认关闭——已定版 App 每次启动不再生成任何日志文件。
+// 只有"诊断中"的新接入 App 才写日志（真机验证 hook 命中用），定版后从白名单移除。
+// 当前诊断白名单：百度地图（新接入，待验证）。其余 App 一律不写日志。
+static BOOL splash_adblock_logEnabled(void) {
+    NSString *bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+    return [bundle isEqualToString:@"com.baidu.map"];
+}
 
 // 本次会话的唯一标志（版本号 + 启动时间戳），进程内只生成一次。
 // 日志文件名继续带标志位，沿用既有约定，便于确认是哪一版、哪一次启动。
@@ -104,6 +113,8 @@ static NSString *splash_adblock_logPath(void) {
 static BOOL splash_adblock_logSessionStarted = NO;
 
 static void splash_adblock_log(NSString *line) {
+    // v0.3.0：已定版 App 不写任何日志（用户要求取消每次打开生成日志）。
+    if (!splash_adblock_logEnabled()) return;
     NSString *path = splash_adblock_logPath();
     NSString *fullLine = [line stringByAppendingString:@"\n"];
     @try {
@@ -130,11 +141,16 @@ static void splash_adblock_log(NSString *line) {
     }
 }
 
-// v0.1.9：启动时清理历史累积的带时间戳日志（旧命名 SplashAdBlock_<tag>_v<...>_<ts>.log），
-// 以及旧的固定文件（下次首次写会重建）。只删本插件前缀，不碰 App 自己的数据。
+// 清理本插件日志。只删 SplashAdBlock_<tag> 前缀的 .log，不碰 App 自己的数据。
+// v0.3.0：
+//  · 日志关闭的 App（已定版）——删掉全部本插件日志（含历史带时间戳文件与固定文件），
+//    一次性清干净手机上的残留，此后不再生成任何日志文件。
+//  · 日志开启的 App（诊断中）——删历史文件，固定文件交由首次 log 覆盖重建。
 static void splash_adblock_pruneOldLogs(void) {
-    NSString *prefix = [NSString stringWithFormat:@"SplashAdBlock_%@_", splash_adblock_logTag()];
+    NSString *tag = splash_adblock_logTag();
+    NSString *prefix = [NSString stringWithFormat:@"SplashAdBlock_%@", tag];
     NSString *current = splash_adblock_logName();
+    BOOL enabled = splash_adblock_logEnabled();
     NSMutableArray *dirs = [NSMutableArray array];
     NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
     if (docs.firstObject) [dirs addObject:docs.firstObject];
@@ -146,19 +162,19 @@ static void splash_adblock_pruneOldLogs(void) {
     NSFileManager *fm = [NSFileManager defaultManager];
     for (NSString *dir in dirs) {
         for (NSString *f in [fm contentsOfDirectoryAtPath:dir error:nil]) {
-            // 删所有本插件前缀的 .log（含旧的带时间戳文件与旧固定文件）；
-            // 当前固定文件马上会在首次 log 时重建，这里删掉可保证本次是干净的单文件。
             if (![f hasPrefix:prefix] || ![f hasSuffix:@".log"]) continue;
-            if ([f isEqualToString:current]) continue;
+            // 日志关闭：全部删除；日志开启：删历史，保留当前固定文件（下面会截断）。
+            if (enabled && [f isEqualToString:current]) continue;
             [fm removeItemAtPath:[dir stringByAppendingPathComponent:f] error:nil];
         }
     }
-    // 当前固定文件：启动时截断为 0，保证「单文件、只含本次启动」。
-    NSString *docDir = docs.firstObject;
-    if (!docDir) docDir = @"/tmp";
-    NSString *curPath = [docDir stringByAppendingPathComponent:current];
-    if ([[NSFileManager defaultManager] fileExistsAtPath:curPath]) {
-        [@"" writeToFile:curPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    // 日志开启时，当前固定文件启动时截断为 0，保证「单文件、只含本次启动」。
+    if (enabled) {
+        NSString *docDir = docs.firstObject ?: @"/tmp";
+        NSString *curPath = [docDir stringByAppendingPathComponent:current];
+        if ([fm fileExistsAtPath:curPath]) {
+            [@"" writeToFile:curPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        }
     }
     splash_adblock_logSessionStarted = NO;
 }
@@ -471,6 +487,26 @@ static void splash_adblock_weiboAdvanceToContent(void) {
                    dispatch_get_main_queue(), ^{
         splash_adblock_weiboAdvanceToContent();
     });
+}
+%end
+
+#pragma mark - 百度地图开屏（仅百度地图生效）
+
+// 学习竞品「广告终结者」百度地图.dylib 的逆向结论：
+// 百度地图开屏是否展示由 BMSplashMaterialManager 的 -isSplashShowClosed 判定。
+// 竞品让该方法返回 YES（App 设计内"开屏已展示过"的合法状态），百度直接走无开屏
+// 路径进主界面——不黑屏、不久留。这与"掐断 show/load"不同：不改广告加载/计时/
+// 回调链，只是把一个状态查询返回真值，符合本项目"绝不掐断回调"的约定。
+// 仅加开屏这一项；竞品其余信息流 hook（红点/滚动通知/NAD 原生广告等）暂不加入，
+// 遵守"一次只加一个 App、先验证核心"的原则。
+%hook BMSplashMaterialManager
+- (BOOL)isSplashShowClosed {
+    if (!splash_adblock_enabled() || !splash_adblock_isBaiduMap()) return %orig;
+    static dispatch_once_t logOnce;
+    dispatch_once(&logOnce, ^{
+        splash_adblock_log(@"[baidu][hook] BMSplashMaterialManager isSplashShowClosed -> YES");
+    });
+    return YES;
 }
 %end
 

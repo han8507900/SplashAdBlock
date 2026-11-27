@@ -4,7 +4,7 @@
 #import "SplashAdBlockPrivate.h"
 
 // ============================================================================
-// 通用屏蔽插件（v0.4.2）
+// 通用屏蔽插件（v0.4.3）
 //
 // 已精准适配（屏蔽逻辑一行未改）：
 //  · 掌盟 com.tencent.ied.app.lolbible —— 广点通 GDT 开屏（透明化）
@@ -19,8 +19,18 @@
 //  · 铁路12306 cn.12306.rails12306     —— 吞两个数据注入 setter（竞品逆向，已定版）
 //  · 下厨房 com.xiachufang.recipe      —— 揭启动占位窗口 + 倍孜广告 VC 透明 + 启动期
 //                                        拦 openURL 防摇一摇跳转（v0.3.4 验证、v0.3.5 定版）
-//  · 威锋   com.feng.New.WPForumClient —— 优量汇 GDT 开屏 VC 透明化 + 走"跳过"dismiss
-//                                        + 启动期 openURL shield 防摇一摇（诊断中）
+//  · 威锋   com.feng.New.WPForumClient —— 优量汇 GDT 开屏 VC 断言覆盖式全屏 + 透明化
+//                                        + 走"跳过"dismiss + 启动期 openURL shield 防摇一摇
+//
+// v0.4.3 威锋修正（v0.4.2 真机反馈："黑屏一闪而过，不要黑屏"）：
+//  · v0.4.2 日志：MATCH → dismiss#1（一次就成功）→ 主界面出现 → done，广告确实没了，
+//    但 present 到 dismiss 之间还有约 0.2s 黑底 —— 黑屏不是残留广告，而是"全屏 present"
+//    这个动作本身：presented 之后主界面 view 被移出层级，presentation container 是黑底，
+//    我们把广告透明掉，露出来的就是黑。
+//  · 本版正解：在 %orig 之前就把开屏链路上的 VC（splash + 优量汇 present 代理 CQAd*）
+//    断言成 UIModalPresentationOverFullScreen —— 只是"看起来全屏"，presenter 的视图仍留在
+//    window 里，所以下面始终是主界面，不存在黑底；再叠加广告树/裸 window/window 级覆盖层
+//    透明化，全程看不到广告也看不到黑屏。dismiss 仍保留（清掉指针、恢复交互）。
 //
 // v0.4.2 威锋修正（v0.4.1 真机反馈："广告变成黑屏了"）：
 //  · 日志真相：真正的开屏是优量汇 GDT —— `[wp][present#9] VC=GDTSplashViewController`，
@@ -128,12 +138,12 @@ static BOOL splash_adblock_isWPForum(void) {
 }
 
 // ---------- 轻量日志（按需开关，无常驻监听、无轮询） ----------
-#define SPLASH_ADBLOCK_VERSION @"0.4.2"
+#define SPLASH_ADBLOCK_VERSION @"0.4.3"
 
 // 日志默认关闭：已定版 App 每次启动不再生成任何日志文件。
 // 接入新 App 做诊断时，这里临时指向它的 bundle，真机验证通过后**下一版必须改回 NO**。
 // 变更记录：百度地图 v0.3.0 诊断→v0.3.1 定版；12306 v0.3.1 诊断→v0.3.2 定版；
-//          下厨房 v0.3.2~v0.3.4 诊断→v0.3.5 定版；威锋 v0.4.0~v0.4.2 诊断中。
+//          下厨房 v0.3.2~v0.3.4 诊断→v0.3.5 定版；威锋 v0.4.0~v0.4.3 诊断中。
 static BOOL splash_adblock_logEnabled(void) {
     NSString *bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
     return [bundle isEqualToString:@"com.feng.New.WPForumClient"];
@@ -752,6 +762,46 @@ static void splash_adblock_wpDismissSplash(UIViewController *vc, NSInteger attem
     }
 }
 
+// window 级覆盖层：presentation 容器里那些直接挂在 window 上的全屏子视图
+// （v0.4.1 日志里的 UITransitionView / CQAdBDPassthroughView / UIImageView）。
+// 只保留 rootViewController.view，其余整棵 alpha=0 —— 主界面永远在最下面露着，不会露黑底。
+static void splash_adblock_wpFadeWindowOverlays(void) {
+    if (!splash_adblock_wpActive()) return;
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        if (![w isKindOfClass:[UIWindow class]]) continue;
+        if (w.windowLevel > 0.01) continue;              // 键盘/状态栏窗口不碰
+        UIView *rootView = w.rootViewController.view;
+        for (UIView *sub in [w.subviews copy]) {
+            if (rootView && (sub == rootView || [sub isDescendantOfView:rootView])) continue;
+            splash_adblock_fadeTree(sub);
+        }
+    }
+}
+
+// 开屏 VC 一律断言成「覆盖式全屏」：
+//   · 全屏 present 会把主界面（MainTabBarController.view）移出层级，presentation container
+//     是黑底 → v0.4.1 只透明广告就会露出黑色（用户看到"黑屏"）。
+//   · OverFullScreen 只是"看起来全屏"，presenter 的视图仍留在 window 里 → 无论广告层是否
+//     透明，下面始终是主界面，不存在黑底。必须在 %orig 之前设置。
+static void splash_adblock_wpPrepareSplashPresentation(UIViewController *vc) {
+    if (!vc) return;
+    if (vc.modalPresentationStyle != UIModalPresentationOverFullScreen) {
+        splash_adblock_log([NSString stringWithFormat:
+            @"[wp] force OverFullScreen for %@ (was %ld)",
+            NSStringFromClass([vc class]), (long)vc.modalPresentationStyle]);
+        vc.modalPresentationStyle = UIModalPresentationOverFullScreen;
+    }
+}
+
+// 开屏链路上的"载体 VC"：优量汇的 present 代理层（CQAdBDPresentProxyVC）+ 各种 splash VC。
+// 这些 VC 也要断言覆盖式全屏，否则代理层自己一铺黑底，后面的透明化就白做。
+static BOOL splash_adblock_wpLooksLikeAdHost(NSString *name) {
+    if (name.length == 0) return NO;
+    if (splash_adblock_wpLooksLikeSplash(name)) return YES;
+    if ([name rangeOfString:@"CQAd" options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+    return NO;
+}
+
 // 命中开屏 VC 的统一入口（present 与 viewDidAppear 两处都调，同一个 VC 只处理一次）。
 // 进程内最多处理 5 次：正常情况下只有 1 次；万一 SDK 判"未展示"重弹，也能再清，
 // 但有上限，绝不会出现"dismiss→重弹→dismiss"的无尽循环。
@@ -767,6 +817,7 @@ static void splash_adblock_wpHandleSplashVC(UIViewController *vc, NSString *wher
     splash_adblock_log([NSString stringWithFormat:@"[wp][MATCH] splash VC=%@ via %@ -> blank + dismiss",
                         NSStringFromClass([vc class]), where]);
     splash_adblock_fadeTree(vc.view);
+    splash_adblock_wpFadeWindowOverlays();
     splash_adblock_wpBlankBareWindows();
     __weak UIViewController *weakVC = vc;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.20 * NSEC_PER_SEC)),
@@ -1173,6 +1224,13 @@ static inline double splash_adblock_zhiboElapsed(void) {
 
 %hook UIViewController
 - (void)presentViewController:(UIViewController *)vc animated:(BOOL)animated completion:(void (^)(void))completion {
+    // ---- 威锋：开屏 VC 在 present 之前就断言成「覆盖式全屏」，主界面不被移出层级 ----
+    // 这一步必须在 %orig 之前：等到 present 完成后再改样式已经晚了（黑底已经铺上了）。
+    if (splash_adblock_wpActive() && vc
+        && splash_adblock_wpLooksLikeAdHost(NSStringFromClass([vc class]))) {
+        splash_adblock_wpPrepareSplashPresentation(vc);
+    }
+
     %orig;
 
     if (!splash_adblock_enabled()) return;

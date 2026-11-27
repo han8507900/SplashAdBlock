@@ -853,10 +853,20 @@ static NSInteger splash_adblock_wpSweep(NSString *why) {
                 continue;
             }
         }
+        CGSize ws = w.bounds.size;
         for (UIView *sub in [w.subviews copy]) {
             if (rootView && (sub == rootView || [sub isDescendantOfView:rootView])) continue;
-            if (sub.alpha > 0.01) { splash_adblock_fadeTree(sub); hits++; }
-            hits += splash_adblock_wpHideAdViews(sub, nil, w);
+            CGRect f = sub.frame;
+            // 只压「近全屏的窗口级覆盖层」（presentation 容器/遮罩/海报）或「含广告渲染视图」的层，
+            // 小尺寸的 HUD/提示不动，避免误伤 App 自己的 loading。
+            BOOL big = ws.width > 0 && f.size.width >= ws.width * 0.8 && f.size.height >= ws.height * 0.5;
+            BOOL adish = splash_adblock_wpTreeHasAdView(sub, 0);
+            if (big || adish) {
+                if (sub.alpha > 0.01) hits++;
+                splash_adblock_fadeTree(sub);
+            } else {
+                hits += splash_adblock_wpHideAdViews(sub, nil, w);
+            }
         }
         if (isMain && rootView) {
             for (UIView *sub in [rootView.subviews copy]) {

@@ -4,7 +4,7 @@
 #import "SplashAdBlockPrivate.h"
 
 // ============================================================================
-// 通用屏蔽插件（v0.3.0）
+// 通用屏蔽插件（v0.3.1）
 //
 // 已精准适配（屏蔽逻辑一行未改）：
 //  · 掌盟 com.tencent.ied.app.lolbible —— 广点通 GDT 开屏（透明化）
@@ -14,16 +14,20 @@
 //                                        + 提前 displayRootViewController 消黑屏
 //  · 微博   com.sina.weibo             —— 启动页 VC 提前 adld_advanceShowAppContent
 //                                        + WBAdSdkFlashAdView 精准 fade（已定版）
+//  · 百度地图 com.baidu.map            —— BMSplashMaterialManager isSplashShowClosed=YES
+//                                        （竞品逆向，已真机验证定版，v0.3.1 起关日志）
 //
-// v0.3.0 新增百度地图 + 日志改造：
-//  · 百度地图 com.baidu.map：学习竞品「广告终结者」百度地图.dylib——hook
-//    BMSplashMaterialManager 的 -isSplashShowClosed 返回 YES，让百度认为开屏已展示过，
-//    走正常"无开屏"路径直接进主界面。这是 App 设计内的状态查询，不改广告加载/计时/
-//    回调链，符合"绝不掐断回调"约定。仅加开屏这一项，信息流广告暂不动（一次一个 App）。
-//  · 日志改造（用户要求"取消每次打开生成日志，后续每个 App 同样处理"）：
-//    新增 splash_adblock_logEnabled 开关——已定版 App 一律不写日志文件，启动时清理
-//    历史残留；仅"诊断中"新接入 App（当前=百度地图）写日志供真机验证，定版后移出白名单。
-//    /tmp 加载标记固定名覆盖写（非 .log、不累积），保留用于确认注入成功。
+// v0.3.1 新增铁路12306：
+//  · 铁路12306 cn.12306.rails12306：学习竞品「广告终结者」12306.dylib——
+//    不调 orig 吞掉 AdvertisService -setBonSplashAd: 与 MTBookTicketHomeTopADView
+//    -setMaterialsList: 的广告注入。这是两个"数据注入 setter"，等价于告诉 App
+//    "无广告可展示"，让它走自带的无开屏路径；不改广告加载/计时/回调链，符合
+//    "绝不掐断回调"约定（与百度地图同构）。诊断白名单=12306，验证通过后移出。
+//
+// 日志策略（用户要求"取消每次打开生成日志，后续每个 App 同样处理"）：
+//  · splash_adblock_logEnabled 开关——已定版 App 一律不写日志文件，启动时清理历史残留；
+//    仅"诊断中"新接入 App（当前=铁路12306）写日志供真机验证，定版后移出白名单。
+//  · /tmp 加载标记固定名覆盖写（非 .log、不累积），保留用于确认注入成功。
 //  无常驻轮询；block 用 __weak；包名不变。其他 App hook 一行未改。
 // ============================================================================
 
@@ -61,15 +65,21 @@ static BOOL splash_adblock_isBaiduMap(void) {
     return [b isEqualToString:@"com.baidu.map"];
 }
 
-// ---------- 轻量日志（按需开关，无常驻监听、无轮询） ----------
-#define SPLASH_ADBLOCK_VERSION @"0.3.0"
+static BOOL splash_adblock_isRail12306(void) {
+    NSString *b = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+    return [b isEqualToString:@"cn.12306.rails12306"];
+}
 
-// v0.3.0：日志默认关闭——已定版 App 每次启动不再生成任何日志文件。
+// ---------- 轻量日志（按需开关，无常驻监听、无轮询） ----------
+#define SPLASH_ADBLOCK_VERSION @"0.3.1"
+
+// v0.3.1：日志默认关闭——已定版 App 每次启动不再生成任何日志文件。
 // 只有"诊断中"的新接入 App 才写日志（真机验证 hook 命中用），定版后从白名单移除。
-// 当前诊断白名单：百度地图（新接入，待验证）。其余 App 一律不写日志。
+// 变更记录：v0.3.0 百度地图诊断 → v0.3.1 百度地图已验证定版，移出白名单；
+// 当前诊断白名单：铁路12306（新接入，待验证）。其余 App 一律不写日志。
 static BOOL splash_adblock_logEnabled(void) {
     NSString *bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
-    return [bundle isEqualToString:@"com.baidu.map"];
+    return [bundle isEqualToString:@"cn.12306.rails12306"];
 }
 
 // 本次会话的唯一标志（版本号 + 启动时间戳），进程内只生成一次。
@@ -93,6 +103,7 @@ static NSString *splash_adblock_logTag(void) {
     // 什么值得买末段是 "ios"、直播吧末段是 "tenyears"，都太通用，特判便于查找
     if ([bundle isEqualToString:@"com.smzdm.client.ios"]) tag = @"smzdm";
     if ([bundle isEqualToString:@"com.zhibo8.tenyears"]) tag = @"zhibo8";
+    if ([bundle isEqualToString:@"cn.12306.rails12306"]) tag = @"12306";
     return tag;
 }
 
@@ -507,6 +518,48 @@ static void splash_adblock_weiboAdvanceToContent(void) {
         splash_adblock_log(@"[baidu][hook] BMSplashMaterialManager isSplashShowClosed -> YES");
     });
     return YES;
+}
+%end
+
+#pragma mark - 铁路12306 开屏（仅 12306 生效）
+
+// 学习竞品「广告终结者」12306.dylib 的逆向结论（已反汇编 constructor 确认）：
+//  · AdvertisService 的 -setBonSplashAd:  —— 注入开屏广告对象
+//  · MTBookTicketHomeTopADView 的 -setMaterialsList: —— 注入开屏素材列表
+// 竞品做法：两个 setter 都"不调 orig、直接返回"（替换函数只有一条 ret 指令），
+// 等价于告诉 App "本次没有广告可注入"，App 走自带的无开屏路径直接进主界面。
+//
+// 为什么安全（符合"绝不掐断回调"约定）：
+//  · 这两个是「数据注入 setter」，不是广告的 show/load/计时/结束回调；
+//    不注入广告 == 用户本来就无广告的那种正常运行态，不开计时器、不卡启动页。
+//  · 与百度地图 isSplashShowClosed=YES 完全同构（都是 App 设计内的无广告状态）。
+//  · 竞品是线上成熟插件、实测有效，非猜测选择器（本次亦反汇编确认类名/方法名无误）。
+// 门控：仅在启用开关 + bundle=cn.12306.rails12306 时吞注入；其余 App/关闭状态完全 %orig。
+%hook AdvertisService
+- (void)setBonSplashAd:(id)ad {
+    if (!splash_adblock_enabled() || !splash_adblock_isRail12306()) {
+        %orig;
+        return;
+    }
+    static dispatch_once_t logOnce;
+    dispatch_once(&logOnce, ^{
+        splash_adblock_log(@"[rail12306][hook] AdvertisService setBonSplashAd: -> swallow (no ad)");
+    });
+    // 不调 %orig：吞掉开屏广告注入，App 走无开屏路径。
+}
+%end
+
+%hook MTBookTicketHomeTopADView
+- (void)setMaterialsList:(id)list {
+    if (!splash_adblock_enabled() || !splash_adblock_isRail12306()) {
+        %orig;
+        return;
+    }
+    static dispatch_once_t logOnce;
+    dispatch_once(&logOnce, ^{
+        splash_adblock_log(@"[rail12306][hook] MTBookTicketHomeTopADView setMaterialsList: -> swallow (no ad)");
+    });
+    // 不调 %orig：吞掉开屏素材注入。
 }
 %end
 

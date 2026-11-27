@@ -36,6 +36,13 @@
 - (void)setHidden:(BOOL)hidden;
 @end
 
+// 开屏 VC（v0.1.2 生命周期探针用，前向声明，不改行为）
+@interface ZBSplashAdViewController : UIViewController
+- (void)viewDidLoad;
+- (void)viewDidAppear:(BOOL)animated;
+- (void)viewWillDisappear:(BOOL)animated;
+@end
+
 // -------- 评分弹窗 --------
 // 系统原生评分控制器（iOS 10.3+）。前向声明避免依赖 StoreKit 框架。
 @interface SKStoreReviewController : NSObject

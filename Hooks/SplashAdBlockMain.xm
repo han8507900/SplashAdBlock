@@ -4,7 +4,7 @@
 #import "SplashAdBlockPrivate.h"
 
 // ============================================================================
-// 通用屏蔽插件（v0.4.7）
+// 通用屏蔽插件（v0.4.8）
 //
 // 已精准适配（屏蔽逻辑一行未改）：
 //  · 掌盟 com.tencent.ied.app.lolbible —— 广点通 GDT 开屏（透明化）
@@ -21,6 +21,20 @@
 //                                        拦 openURL 防摇一摇跳转（v0.3.4 验证、v0.3.5 定版）
 //  · 威锋   com.feng.New.WPForumClient —— 优量汇 GDT 开屏：只清广告类视图（不碰主界面容器）
 //                                        + 断言覆盖式全屏 + 走"跳过"dismiss + 启动期 openURL shield
+//
+// v0.4.8 威锋修正（v0.4.7 真机反馈："摇一摇会有个白色窗口"）：
+//  · v0.4.7 已经完全修好黑屏：`[wp][t0.35] subs=[UITransitionView(393x852 a1.00,full)]`，
+//    主界面直接可见，广告类视图 alpha=0。
+//  · 新问题不是开屏广告，而是摇一摇**跳 App Store**：日志
+//      [wp][present#10] VC=SKStoreProductViewController
+//      [wp][present#12] VC=ServiceCardContainerViewController
+//      [wp][vc#19/#20] _UIResilientRemoteViewContainerViewController > SKProductPageRemoteViewController
+//    这条链路是**进程内 present**，不走 openURL，所以原有 15s URL shield 拦不住 → 一块白色全屏。
+//  · v0.4.8：present 钩子里加一道"启动期 shield 内吞掉商店/内置浏览器页"
+//    （SKStoreProductViewController / SKProductPage* / ServiceCardContainer* /
+//     _UIResilientRemoteViewContainer / SFSafariViewController），等价"点了没反应"；
+//    已经被 present 出来的（shield 生效前）由 recover 的呈现链扫描 dismiss 掉。
+//    商品页对 App 启动流程没有回调依赖，吞掉安全；上限 20 次记日志，防刷屏。
 //
 // v0.4.7 威锋修正（v0.4.6 真机反馈："还是不行"——依然黑屏，且这次日志自己暴露了根因）：
 //  · 日志 55 行，关键四行：
@@ -199,12 +213,12 @@ static BOOL splash_adblock_isWPForum(void) {
 }
 
 // ---------- 轻量日志（按需开关，无常驻监听、无轮询） ----------
-#define SPLASH_ADBLOCK_VERSION @"0.4.7"
+#define SPLASH_ADBLOCK_VERSION @"0.4.8"
 
 // 日志默认关闭：已定版 App 每次启动不再生成任何日志文件。
 // 接入新 App 做诊断时，这里临时指向它的 bundle，真机验证通过后**下一版必须改回 NO**。
 // 变更记录：百度地图 v0.3.0 诊断→v0.3.1 定版；12306 v0.3.1 诊断→v0.3.2 定版；
-//          下厨房 v0.3.2~v0.3.4 诊断→v0.3.5 定版；威锋 v0.4.0~v0.4.7 诊断中。
+//          下厨房 v0.3.2~v0.3.4 诊断→v0.3.5 定版；威锋 v0.4.0~v0.4.8 诊断中。
 static BOOL splash_adblock_logEnabled(void) {
     NSString *bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
     return [bundle isEqualToString:@"com.feng.New.WPForumClient"];
@@ -710,6 +724,33 @@ static BOOL splash_adblock_wpShouldBlockURL(NSURL *url) {
     return YES;
 }
 
+static BOOL splash_adblock_wpShieldActive(void) {
+    if (!splash_adblock_enabled() || !splash_adblock_isWPForum()) return NO;
+    if (splash_adblock_wpShieldUntil <= 0) return NO;
+    return [[NSDate date] timeIntervalSince1970] <= splash_adblock_wpShieldUntil;
+}
+
+// ---- 摇一摇跳转 App Store：白色窗口是进程内 present 出来的商品页 ----
+// v0.4.7 日志：`[wp][present#10] VC=SKStoreProductViewController` →
+// `[wp][present#12] ServiceCardContainerViewController` →
+// `_UIResilientRemoteViewContainerViewController` > `SKProductPageRemoteViewController`。
+// 这条链路**不走 openURL**，所以原有 shield 拦不住；用户看到的就是一块白色全屏。
+// 处理：启动期 shield 内直接不执行 present（等价"点了没反应"），并记 [wp][BLOCK]。
+// 商品页对 App 启动流程没有回调依赖，吞掉安全。
+static BOOL splash_adblock_wpLooksLikeStore(NSString *name) {
+    if (name.length == 0) return NO;
+    NSString *l = name.lowercaseString;
+    if ([l containsString:@"skstoreproduct"]) return YES;
+    if ([l containsString:@"skproductpage"]) return YES;
+    if ([l containsString:@"servicecardcontainer"]) return YES;
+    if ([l containsString:@"uiresilientremoteviewcontainer"]) return YES;
+    // 摇一摇也常把落地页塞进 SFSafariViewController（同样是整块白屏）
+    if ([l containsString:@"sfsafariviewcontroller"]) return YES;
+    return NO;
+}
+
+static NSInteger splash_adblock_wpStoreBlocked = 0;
+
 // ---- 兜底：启动占位窗口在主界面就绪后揭掉（不依赖具体类名） ----
 // 只处理「level>100 且 root VC 类名含 Launch/Splash」的窗口，且必须已有可见的
 // TabBar 主界面窗口才动手，避免误伤首启引导页/登录页。
@@ -968,7 +1009,8 @@ static UIViewController *splash_adblock_wpFindPresentedAd(UIViewController *vc, 
     UIViewController *p = vc.presentedViewController;
     NSInteger guard = 0;
     while (p && p != vc && guard++ < 8) {
-        if (splash_adblock_wpLooksLikeAdHost(NSStringFromClass([p class]))) return p;
+        NSString *pn = NSStringFromClass([p class]);
+        if (splash_adblock_wpLooksLikeAdHost(pn) || splash_adblock_wpLooksLikeStore(pn)) return p;
         p = p.presentedViewController;
     }
     if ([vc isKindOfClass:[UINavigationController class]]) {
@@ -1245,7 +1287,7 @@ static void splash_adblock_wpStartProtection(void) {
     if (!splash_adblock_wpActive()) return;
     splash_adblock_wpShieldUntil = [[NSDate date] timeIntervalSince1970] + 15.0;
     splash_adblock_wpLaunchTime = [[NSDate date] timeIntervalSince1970];
-    splash_adblock_log(@"[wp] active: GDT ad-only sweep 0.35~9.5s + recover + openURL shield 15s");
+    splash_adblock_log(@@"[wp] active: ad-only sweep + recover + block store page/openURL 15s");
     splash_adblock_wpScheduleSweeps();
 }
 
@@ -1635,6 +1677,16 @@ static inline double splash_adblock_zhiboElapsed(void) {
     if (splash_adblock_wpActive() && vc
         && splash_adblock_wpLooksLikeAdHost(NSStringFromClass([vc class]))) {
         splash_adblock_wpPrepareSplashPresentation(vc);
+    }
+
+    // ---- 威锋：启动期拦掉摇一摇打开的 App Store 商品页（白色全屏窗口） ----
+    if (vc && splash_adblock_wpShieldActive()
+        && splash_adblock_wpLooksLikeStore(NSStringFromClass([vc class]))) {
+        if (splash_adblock_wpStoreBlocked < 20) splash_adblock_wpStoreBlocked++;
+        splash_adblock_log([NSString stringWithFormat:
+            @"[wp][BLOCK #%ld] store page present suppressed: %@",
+            (long)splash_adblock_wpStoreBlocked, NSStringFromClass([vc class])]);
+        return;
     }
 
     %orig;

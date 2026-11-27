@@ -155,7 +155,9 @@ static void splash_adblock_pruneOldLogs(void) {
         }
     }
     // 当前固定文件：启动时截断为 0，保证「单文件、只含本次启动」。
-    NSString *curPath = [[docs.firstObject ?: @"/tmp"] stringByAppendingPathComponent:current];
+    NSString *docDir = docs.firstObject;
+    if (!docDir) docDir = @"/tmp";
+    NSString *curPath = [docDir stringByAppendingPathComponent:current];
     if ([[NSFileManager defaultManager] fileExistsAtPath:curPath]) {
         [@"" writeToFile:curPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
     }

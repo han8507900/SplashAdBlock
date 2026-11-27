@@ -372,11 +372,15 @@ static __weak WBLaunchNewViewController *splash_adblock_weiboLaunchVC = nil;
 static WBLaunchNewViewController *splash_adblock_weiboFindLaunchVC(void) {
     WBLaunchNewViewController *saved = splash_adblock_weiboLaunchVC;
     if (saved) return saved;
+    // 私有类运行时才存在；用 NSClassFromString 避免生成链接期类符号（否则 ld 报
+    // _OBJC_CLASS_$_WBLaunchNewViewController undefined）。
+    Class launchClass = NSClassFromString(@"WBLaunchNewViewController");
+    if (!launchClass) return nil;
     for (UIWindow *w in [UIApplication sharedApplication].windows) {
         UIViewController *vc = w.rootViewController;
         NSInteger depth = 0;
         while (vc && depth < 16) { // 深度上限，防异常 presented 链死循环
-            if ([vc isKindOfClass:[WBLaunchNewViewController class]]) {
+            if ([vc isKindOfClass:launchClass]) {
                 return (WBLaunchNewViewController *)vc;
             }
             vc = vc.presentedViewController;

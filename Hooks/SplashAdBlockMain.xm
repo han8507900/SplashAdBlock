@@ -889,6 +889,7 @@ static void splash_adblock_wpHandleSplashVC(UIViewController *vc, NSString *wher
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             if (!splash_adblock_wpActive()) return;
+            splash_adblock_wpFadeWindowOverlays();
             splash_adblock_wpBlankAdWindows();
             splash_adblock_wpDumpWindows([NSString stringWithFormat:@"t%@", d]);
         });
@@ -912,6 +913,7 @@ static void splash_adblock_wpStartProtection(void) {
                        dispatch_get_main_queue(), ^{
             if (!splash_adblock_wpProbeActive()) return;
             splash_adblock_wpRevealLaunchWindow();
+            splash_adblock_wpFadeWindowOverlays();
             splash_adblock_wpBlankAdWindows();
         });
     }

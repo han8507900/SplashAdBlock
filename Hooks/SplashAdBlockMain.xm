@@ -4,20 +4,20 @@
 #import "SplashAdBlockPrivate.h"
 
 // ============================================================================
-// 通用屏蔽插件（v0.1.0）
+// 通用屏蔽插件（v0.1.1）
 //
-// 已精准适配（沿用 v0.0.9，逻辑一行未改）：
+// 已精准适配：
 //  · 掌盟 com.tencent.ied.app.lolbible —— 广点通 GDT 开屏（透明化）
 //  · 闪联 com.shanlian.pro             —— 评分弹窗
 //  · 什么值得买 com.smzdm.client.ios   —— SMFullWindowAdView 开屏（精准透明化）
+//  · 直播吧 com.zhibo8.tenyears        —— ZBSplashView 开屏（精准透明化，v0.1.1）
 //
-// v0.1.0 新增：直播吧 com.zhibo8.tenyears（两个广告：打开全屏 + 进入后弹窗）
-//  按既有方法论「不猜类名、先探针」：
-//   1) 一次性探针：启动初期 dump 广告类名/方法/窗口树；弹窗侧通过 present VC /
-//      viewDidAppear / 新 window 可见通知事件驱动 dump，限次限时（120s）。
-//   2) 保守兜底：只对明确命中广告关键词的全屏 view、或高 level 独立 window
-//      做 alpha=0；不 hidden、不移除、不 dismiss、不掐断任何回调。
-//   3) 拿到日志里的真实容器类名后，下一版改成精准 hook 并移除探针。
+// v0.1.1 相对 v0.1.0 的变化：
+//  · 开屏从泛化兜底升级为精准 hook ZBSplashView（didMoveToWindow/layoutSubviews/
+//    setHidden 三个时机都 fade），覆盖后加入的子视图（ZBSplashAdNewSlideInteractionView）。
+//  · dumpMethods 优先 dump 直播吧自有 ZBSplash*/ZBPopup* 类的方法列表，
+//    用于查黑屏等待期有无安全的提前结束回调（不掐断、不动广告 SDK 回调链）。
+//  · 弹窗探针保留（present VC / viewDidAppear / window 可见通知，限次限时 120s）。
 //  全程无常驻轮询；日志单路径 + 自动清理；包名不变。
 // ============================================================================
 
@@ -46,7 +46,7 @@ static BOOL splash_adblock_isZhibo8(void) {
 }
 
 // ---------- 轻量日志（单路径 + 自动清理，无常驻监听、无轮询） ----------
-#define SPLASH_ADBLOCK_VERSION @"0.1.0"
+#define SPLASH_ADBLOCK_VERSION @"0.1.1"
 
 // 本次会话的唯一标志（版本号 + 启动时间戳），进程内只生成一次。
 // 日志文件名继续带标志位，沿用既有约定，便于确认是哪一版、哪一次启动。
@@ -277,16 +277,27 @@ static void splash_adblock_zhiboDumpClasses(void) {
 
 static void splash_adblock_zhiboDumpMethods(void) {
     NSMutableArray *targets = [NSMutableArray array];
+    NSMutableArray *zbOwn = [NSMutableArray array];
     unsigned int count = 0;
     Class *classes = objc_copyClassList(&count);
     if (classes) {
         for (unsigned int i = 0; i < count; i++) {
             NSString *name = NSStringFromClass(classes[i]);
-            if (splash_adblock_zhiboNameLooksLikeAd(name)) [targets addObject:name];
+            // 直播吧自有类优先：开屏容器/管理/动画/弹窗
+            if ([name hasPrefix:@"ZB"] &&
+                ([name rangeOfString:@"Splash"].location != NSNotFound ||
+                 [name rangeOfString:@"Popup"].location != NSNotFound ||
+                 [name rangeOfString:@"Advert"].location != NSNotFound)) {
+                [zbOwn addObject:name];
+            } else if (splash_adblock_zhiboNameLooksLikeAd(name)) {
+                [targets addObject:name];
+            }
         }
         free(classes);
     }
-    NSUInteger lim = MIN(targets.count, 40);
+    // 自有类排前面，确保优先被 dump 到
+    [targets insertObjects:zbOwn atIndexes:[NSIndexSet indexSetWithIndexesInRange:NSMakeRange(0, zbOwn.count)]];
+    NSUInteger lim = MIN(targets.count, 60);
     splash_adblock_log([NSString stringWithFormat:@"[zhibo][methods] ad-like classes=%lu (dump %lu)",
                         (unsigned long)targets.count, (unsigned long)lim]);
     for (NSUInteger i = 0; i < lim; i++) {
@@ -432,6 +443,31 @@ static void splash_adblock_zhiboStartProbe(void) {
 - (void)setHidden:(BOOL)hidden {
     %orig;
     if (!splash_adblock_enabled() || !splash_adblock_isSmzdm()) return;
+    if (!hidden) splash_adblock_fadeTree(self);
+}
+%end
+
+#pragma mark - 直播吧开屏容器（精准 hook，仅直播吧生效）
+
+// v0.1.0 日志确认：ZBSplashView(393x852) 是开屏全屏容器，
+// 素材视图 ZBSplashAdMaterialView / ZBSplashAdNewSlideInteractionView 都是它的子视图。
+// 三个时机都 fade：覆盖 view 从 window 出现、后续布局、以及复用时再次显示。
+// 只做 alpha=0，不 hidden、不移除、不跳过、不碰广告 SDK 的计时/回调链。
+%hook ZBSplashView
+- (void)didMoveToWindow {
+    %orig;
+    if (!splash_adblock_enabled() || !splash_adblock_isZhibo8()) return;
+    splash_adblock_log(@"[zhibo][hook] ZBSplashView didMoveToWindow -> fade");
+    splash_adblock_fadeTree(self);
+}
+- (void)layoutSubviews {
+    %orig;
+    if (!splash_adblock_enabled() || !splash_adblock_isZhibo8()) return;
+    splash_adblock_fadeTree(self);
+}
+- (void)setHidden:(BOOL)hidden {
+    %orig;
+    if (!splash_adblock_enabled() || !splash_adblock_isZhibo8()) return;
     if (!hidden) splash_adblock_fadeTree(self);
 }
 %end

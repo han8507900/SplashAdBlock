@@ -28,6 +28,14 @@
 @interface SMFullWindowAdView : UIView
 @end
 
+// -------- 直播吧开屏容器（真机 v0.1.0 日志确认）--------
+// ZBSplashView 全屏 393x852，素材子视图 ZBSplashAdMaterialView / ZBSplashAdNewSlideInteractionView。
+@interface ZBSplashView : UIView
+- (void)didMoveToWindow;
+- (void)layoutSubviews;
+- (void)setHidden:(BOOL)hidden;
+@end
+
 // -------- 评分弹窗 --------
 // 系统原生评分控制器（iOS 10.3+）。前向声明避免依赖 StoreKit 框架。
 @interface SKStoreReviewController : NSObject

@@ -72,6 +72,18 @@
 - (BOOL)isSplashShowClosed;
 @end
 
+// -------- 铁路12306 开屏（竞品「广告终结者」12306.dylib 逆向确认）--------
+// AdvertisService 的 -setBonSplashAd: 注入开屏广告；返回 YES 路径由竞品阻断注入。
+// MTBookTicketHomeTopADView 的 -setMaterialsList: 注入开屏素材列表。
+// 竞品做法是不调 orig，直接吞掉注入（等价于"无广告可展示"，App 走无开屏路径）。
+@interface AdvertisService : NSObject
+- (void)setBonSplashAd:(id)ad;
+@end
+
+@interface MTBookTicketHomeTopADView : UIView
+- (void)setMaterialsList:(id)list;
+@end
+
 // -------- 评分弹窗 --------
 // 系统原生评分控制器（iOS 10.3+）。前向声明避免依赖 StoreKit 框架。
 @interface SKStoreReviewController : NSObject

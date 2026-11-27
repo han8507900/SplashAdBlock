@@ -4,25 +4,24 @@
 #import "SplashAdBlockPrivate.h"
 
 // ============================================================================
-// 通用屏蔽插件（v0.1.5）
+// 通用屏蔽插件（v0.1.6）
 //
-// 已精准适配（屏蔽逻辑相对 v0.1.4 一行未改）：
+// 已精准适配（屏蔽逻辑一行未改）：
 //  · 掌盟 com.tencent.ied.app.lolbible —— 广点通 GDT 开屏（透明化）
 //  · 闪联 com.shanlian.pro             —— 评分弹窗
 //  · 什么值得买 com.smzdm.client.ios   —— SMFullWindowAdView 开屏（精准透明化）
 //  · 直播吧 com.zhibo8.tenyears        —— ZBSplashView 开屏（精准透明化）
 //                                        + 提前 displayRootViewController 消黑屏
 //
-// v0.1.5 相对 v0.1.4 的变化（纯清理，屏蔽行为零改动）：
-//  背景：直播吧开屏已在 v0.1.1 精准 hook、黑屏已在 v0.1.3/0.1.4 解决，
-//        但 v0.1.0~v0.1.2 的诊断探针仍然每次启动照跑照写（类名/方法/签名 dump、
-//        8 次窗口树快照、生命周期日志、逐个 VC 日志），属无用开销。
-//  · 移除：zhiboDumpClasses / zhiboDumpMethods / zhiboDumpTargetSignatures /
-//    zhiboDumpWindows、8 次窗口树 tick、root VC 记录、开屏 VC 生命周期日志、
-//    逐 VC 常规日志。窗口树底层工具函数保留（弹窗探针仍用它 dump 命中弹窗）。
-//  · 保留：弹窗探针（present VC + 新 window 观察，各限次、120s 自动失效）、
-//    3 次轻量兜底 tick（只在命中时写日志）、全部精准 hook 与黑屏修复。
-//  全程无常驻轮询；日志单路径 + 自动清理（每目录留最近 2 份）；包名不变。
+// v0.1.6 新增：微博 com.sina.weibo（开屏广告，可能另有弹窗）。
+//  按老规矩「不猜类名、先探针」——真实广告容器类名未知：
+//  · 一次性探针：启动 dump 广告类名/方法 + 5 次有限 tick 窗口树快照；
+//    弹窗走 present VC / 新 window 事件。限次限时（120s）、无常驻轮询。
+//  · 保守兜底：只对命中广告关键词的全屏 view / 高 level 独立 window 做 alpha=0；
+//    不 dismiss、不移除、不掐断任何回调。
+//  · 全部微博逻辑 bundle 门控，其他四个 App 的 hook 一行未改。
+//  拿到日志里真实类名后，下一版改精准 hook 并移除微博探针（沿用直播吧节奏）。
+//  日志单路径 + 自动清理（每目录留最近 2 份）；包名不变。
 // ============================================================================
 
 static BOOL splash_adblock_enabled(void) {
@@ -49,8 +48,13 @@ static BOOL splash_adblock_isZhibo8(void) {
     return [b isEqualToString:@"com.zhibo8.tenyears"];
 }
 
+static BOOL splash_adblock_isWeibo(void) {
+    NSString *b = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+    return [b isEqualToString:@"com.sina.weibo"];
+}
+
 // ---------- 轻量日志（单路径 + 自动清理，无常驻监听、无轮询） ----------
-#define SPLASH_ADBLOCK_VERSION @"0.1.5"
+#define SPLASH_ADBLOCK_VERSION @"0.1.6"
 
 // 本次会话的唯一标志（版本号 + 启动时间戳），进程内只生成一次。
 // 日志文件名继续带标志位，沿用既有约定，便于确认是哪一版、哪一次启动。
@@ -327,6 +331,193 @@ static void splash_adblock_zhiboStartProbe(void) {
     splash_adblock_zhiboStartWindowObserver();
 }
 
+#pragma mark - 微博：开屏 + 弹窗 一次性探针与保守兜底（仅微博生效）
+
+// v0.1.6：微博 com.sina.weibo 广告容器类名未知，按老规矩「不猜类名、先探针」。
+// 启动后一次性 dump 广告类名/方法 + 有限 tick 窗口树；弹窗走 present VC / 新 window 事件。
+// 只对命中广告关键词的全屏 view 或高 level 独立 window 做 alpha=0，不 dismiss、不掐回调。
+// 全部 bundle 门控、限次限时（120s），无常驻轮询；拿到真实类名后下一版改精准 hook 并移除探针。
+static NSTimeInterval splash_adblock_weiboLaunchTime = 0;
+static NSInteger splash_adblock_weiboPresentCount = 0;
+static NSInteger splash_adblock_weiboVCCount = 0;
+static NSInteger splash_adblock_weiboWindowCount = 0;
+static id splash_adblock_weiboWindowObserver = nil;
+
+static BOOL splash_adblock_weiboProbeActive(void) {
+    if (!splash_adblock_enabled() || !splash_adblock_isWeibo()) return NO;
+    NSTimeInterval elapsed = [[NSDate date] timeIntervalSince1970] - splash_adblock_weiboLaunchTime;
+    return elapsed >= 0 && elapsed <= 120;
+}
+
+// 广告关键词：通用广告 SDK + 微博自有广告前缀（WB/WBAd/Sina 等）。不含裸 "ad" 防误伤。
+static BOOL splash_adblock_weiboNameLooksLikeAd(NSString *name) {
+    if (!name || name.length == 0) return NO;
+    NSString *lower = [name lowercaseString];
+    NSArray *keys = @[@"splash", @"launchad", @"openscreen", @"openads", @"flashad",
+                      @"startupad", @"splashad", @"全屏广告", @"开屏", @"广告", @"弹窗",
+                      @"abu", @"csj", @"pangle", @"jgads", @"busplash", @"gdt",
+                      @"ksad", @"sigmob", @"interstitial", @"adview", @"adbanner", @"popup",
+                      @"wbadsplash", @"wbadsplashview", @"wbsplash", @"wblaunch", @"wbopen",
+                      @"sinaad", @"weiboad", @"adviewcontroller"];
+    for (NSString *k in keys) {
+        if ([lower rangeOfString:k options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+    }
+    return NO;
+}
+
+// 有限深度、有限行数的视图树 dump。
+static void splash_adblock_weiboDumpTree(UIView *v, NSInteger depth, NSMutableString *out, NSInteger *lines) {
+    if (!v || depth > 6 || *lines > 140) return;
+    CGRect f = v.frame;
+    NSString *pad = [@"" stringByPaddingToLength:depth * 2 withString:@" " startingAtIndex:0];
+    [out appendFormat:@"%@%@ (%.0f,%.0f %.0fx%.0f) a=%.2f h=%d\n", pad,
+        NSStringFromClass([v class]), f.origin.x, f.origin.y, f.size.width, f.size.height,
+        v.alpha, v.hidden];
+    (*lines)++;
+    for (UIView *sub in v.subviews) splash_adblock_weiboDumpTree(sub, depth + 1, out, lines);
+}
+
+static void splash_adblock_weiboDumpClasses(void) {
+    NSMutableArray *hits = [NSMutableArray array];
+    unsigned int count = 0;
+    Class *classes = objc_copyClassList(&count);
+    if (classes) {
+        for (unsigned int i = 0; i < count; i++) {
+            NSString *name = NSStringFromClass(classes[i]);
+            if (splash_adblock_weiboNameLooksLikeAd(name)) [hits addObject:name];
+        }
+        free(classes);
+    }
+    splash_adblock_log([NSString stringWithFormat:@"[weibo][classes] ad-like=%lu", (unsigned long)hits.count]);
+    NSUInteger lim = MIN(hits.count, 120);
+    for (NSUInteger i = 0; i < lim; i++)
+        splash_adblock_log([NSString stringWithFormat:@"   %@", hits[i]]);
+}
+
+static void splash_adblock_weiboDumpMethods(void) {
+    NSMutableArray *targets = [NSMutableArray array];
+    unsigned int count = 0;
+    Class *classes = objc_copyClassList(&count);
+    if (classes) {
+        for (unsigned int i = 0; i < count; i++) {
+            NSString *name = NSStringFromClass(classes[i]);
+            if (splash_adblock_weiboNameLooksLikeAd(name)) [targets addObject:name];
+        }
+        free(classes);
+    }
+    NSUInteger lim = MIN(targets.count, 60);
+    splash_adblock_log([NSString stringWithFormat:@"[weibo][methods] ad-like=%lu (dump %lu)",
+                        (unsigned long)targets.count, (unsigned long)lim]);
+    for (NSUInteger i = 0; i < lim; i++) {
+        Class c = NSClassFromString(targets[i]);
+        if (!c) continue;
+        unsigned int mc = 0;
+        Method *ms = class_copyMethodList(c, &mc);
+        NSMutableArray *sels = [NSMutableArray array];
+        for (unsigned int j = 0; j < mc; j++)
+            [sels addObject:NSStringFromSelector(method_getName(ms[j]))];
+        if (ms) free(ms);
+        splash_adblock_log([NSString stringWithFormat:@"[CLASS] %@ :: %@", targets[i],
+                            [sels componentsJoinedByString:@", "]]);
+    }
+}
+
+// 只对「命中广告类名 + 接近全屏」的 view 做 alpha=0，跳过 root view。
+static void splash_adblock_weiboFadeRecursive(UIView *v, UIWindow *win, BOOL isRoot) {
+    if (!v || isRoot) return;
+    NSString *cls = NSStringFromClass([v class]);
+    CGRect f = v.frame;
+    CGSize s = win.bounds.size;
+    BOOL fullscreen = s.width > 0 && f.size.width >= s.width * 0.8
+                      && f.size.height >= s.height * 0.5;
+    if (fullscreen && splash_adblock_weiboNameLooksLikeAd(cls)) {
+        splash_adblock_log([NSString stringWithFormat:@"[weibo][MATCH] ad view %@ frame=%@ -> fade",
+                            cls, NSStringFromCGRect(f)]);
+        splash_adblock_fadeTree(v);
+    }
+    BOOL childIsRoot = [v isEqual:win.rootViewController.view];
+    for (UIView *sub in v.subviews) splash_adblock_weiboFadeRecursive(sub, win, childIsRoot);
+}
+
+static void splash_adblock_weiboFadeFullscreenAds(void) {
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        CGFloat level = w.windowLevel;
+        if (level > 100 && level < 3000) {
+            splash_adblock_log([NSString stringWithFormat:@"[weibo][MATCH] high-level window level=%.0f root=%@ -> fade",
+                                level, NSStringFromClass([w.rootViewController class])]);
+            splash_adblock_fadeTree(w);
+            continue;
+        }
+        for (UIView *v in w.subviews)
+            splash_adblock_weiboFadeRecursive(v, w, [v isEqual:w.rootViewController.view]);
+    }
+}
+
+static void splash_adblock_weiboDumpWindows(NSString *when) {
+    NSInteger lines = 0;
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        NSMutableString *out = [NSMutableString stringWithFormat:
+            @"[weibo][tree@%@] WINDOW level=%.0f root=%@ bounds=%@\n",
+            when, w.windowLevel, NSStringFromClass([w.rootViewController class]), NSStringFromCGRect(w.bounds)];
+        lines++;
+        for (UIView *v in w.subviews) splash_adblock_weiboDumpTree(v, 0, out, &lines);
+        splash_adblock_log(out);
+    }
+}
+
+// 新 window 出现事件：限 12 次，120s 后自动移除观察者。
+static void splash_adblock_weiboStartWindowObserver(void) {
+    splash_adblock_weiboWindowObserver =
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIWindowDidBecomeVisibleNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(NSNotification *note) {
+        if (!splash_adblock_weiboProbeActive()) return;
+        if (splash_adblock_weiboWindowCount >= 12) return;
+        splash_adblock_weiboWindowCount++;
+        UIWindow *w = note.object;
+        if (![w isKindOfClass:[UIWindow class]]) return;
+        splash_adblock_log([NSString stringWithFormat:@"[weibo][window#%ld] level=%.0f root=%@",
+                            (long)splash_adblock_weiboWindowCount, w.windowLevel,
+                            NSStringFromClass([w.rootViewController class])]);
+        NSInteger lines = 0;
+        NSMutableString *out = [NSMutableString string];
+        for (UIView *v in w.subviews) splash_adblock_weiboDumpTree(v, 0, out, &lines);
+        splash_adblock_log(out);
+        if (w.windowLevel > 100 && w.windowLevel < 3000) {
+            splash_adblock_log(@"[weibo][MATCH] high-level window -> fade");
+            splash_adblock_fadeTree(w);
+        }
+    }];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(120 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (splash_adblock_weiboWindowObserver) {
+            [[NSNotificationCenter defaultCenter] removeObserver:splash_adblock_weiboWindowObserver];
+            splash_adblock_weiboWindowObserver = nil;
+            splash_adblock_log(@"[weibo] window observer removed");
+        }
+    });
+}
+
+// 一次性探针入口：类名/方法各 dump 一次；窗口树有限 tick 覆盖到 12s（开屏早期）。
+static void splash_adblock_weiboStartProbe(void) {
+    if (!splash_adblock_enabled() || !splash_adblock_isWeibo()) return;
+    splash_adblock_weiboLaunchTime = [[NSDate date] timeIntervalSince1970];
+    splash_adblock_log(@"[weibo] === one-shot probe start ===");
+    splash_adblock_weiboDumpClasses();
+    splash_adblock_weiboDumpMethods();
+    NSArray *ticks = @[@0.5, @1.5, @3.0, @6.0, @12.0];
+    for (NSNumber *t in ticks) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(t.doubleValue * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (!splash_adblock_weiboProbeActive()) return;
+            splash_adblock_weiboFadeFullscreenAds();
+            splash_adblock_weiboDumpWindows([NSString stringWithFormat:@"%.1fs", t.doubleValue]);
+        });
+    }
+    splash_adblock_weiboStartWindowObserver();
+}
+
 #pragma mark - 掌盟开屏（仅掌盟生效）
 
 %hook TGGDTSplashViewController
@@ -457,7 +648,7 @@ static inline double splash_adblock_zhiboElapsed(void) {
 }
 %end
 
-#pragma mark - 全局 VC hook（闪联评分弹窗 + 直播吧弹窗探针）
+#pragma mark - 全局 VC hook（闪联评分弹窗 + 直播吧/微博弹窗探针）
 
 %hook UIViewController
 - (void)presentViewController:(UIViewController *)vc animated:(BOOL)animated completion:(void (^)(void))completion {
@@ -514,28 +705,72 @@ static inline double splash_adblock_zhiboElapsed(void) {
             });
         }
     }
+
+    // ---- 微博：弹窗探针（事件驱动、限 15 次、120s 内） ----
+    if (splash_adblock_isWeibo() && vc && splash_adblock_weiboProbeActive()
+        && splash_adblock_weiboPresentCount < 15) {
+        splash_adblock_weiboPresentCount++;
+        NSString *vcName = NSStringFromClass([vc class]);
+        NSString *title = vc.title;
+        NSString *msg = [vc isKindOfClass:[UIAlertController class]] ? ((UIAlertController *)vc).message : nil;
+        splash_adblock_log([NSString stringWithFormat:@"[weibo][present] VC=%@ title=%@ msg=%@",
+                            vcName, title ?: @"", msg ?: @""]);
+        NSInteger lines = 0;
+        NSMutableString *out = [NSMutableString string];
+        splash_adblock_weiboDumpTree(vc.view, 0, out, &lines);
+        splash_adblock_log(out);
+        if (splash_adblock_weiboNameLooksLikeAd(vcName)) {
+            splash_adblock_log([NSString stringWithFormat:@"[weibo][MATCH] ad-like popup VC=%@ -> fade", vcName]);
+            __weak UIViewController *weakVC = vc;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.02 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                UIViewController *strongVC = weakVC;
+                if (!strongVC || !splash_adblock_weiboProbeActive()) return;
+                splash_adblock_fadeTree(strongVC.view);
+            });
+        }
+    }
 }
 
 - (void)viewDidAppear:(BOOL)animated {
     %orig;
-
-    if (!splash_adblock_zhiboProbeActive()) return;
-    if (splash_adblock_zhiboVCCount >= 60) return;
-    splash_adblock_zhiboVCCount++;
     NSString *cls = NSStringFromClass([self class]);
 
-    // v0.1.5：普通 VC 不再逐个写日志（消除每次启动的垃圾日志）。
-    // 命中广告特征 VC -> 事件驱动兜底（一次性延迟补刀，非轮询），只在此刻记录。
-    if (splash_adblock_zhiboNameLooksLikeAd(cls)) {
-        splash_adblock_log([NSString stringWithFormat:@"[zhibo][MATCH] ad-like VC=%@ -> fade", cls]);
-        __weak UIViewController *weakSelf = self;
-        for (NSNumber *d in @[@0.02, @0.2, @0.7]) {
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                UIViewController *strongSelf = weakSelf;
-                if (!strongSelf || !splash_adblock_zhiboProbeActive()) return;
-                splash_adblock_fadeTree(strongSelf.view);
-            });
+    // ---- 直播吧：命中广告特征 VC -> 事件驱动兜底（一次性延迟补刀） ----
+    if (splash_adblock_zhiboProbeActive()) {
+        if (splash_adblock_zhiboVCCount < 60) {
+            splash_adblock_zhiboVCCount++;
+            if (splash_adblock_zhiboNameLooksLikeAd(cls)) {
+                splash_adblock_log([NSString stringWithFormat:@"[zhibo][MATCH] ad-like VC=%@ -> fade", cls]);
+                __weak UIViewController *weakSelf = self;
+                for (NSNumber *d in @[@0.02, @0.2, @0.7]) {
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{
+                        UIViewController *strongSelf = weakSelf;
+                        if (!strongSelf || !splash_adblock_zhiboProbeActive()) return;
+                        splash_adblock_fadeTree(strongSelf.view);
+                    });
+                }
+            }
+        }
+    }
+
+    // ---- 微博：命中广告特征 VC -> 事件驱动兜底 ----
+    if (splash_adblock_weiboProbeActive()) {
+        if (splash_adblock_weiboVCCount < 60) {
+            splash_adblock_weiboVCCount++;
+            if (splash_adblock_weiboNameLooksLikeAd(cls)) {
+                splash_adblock_log([NSString stringWithFormat:@"[weibo][MATCH] ad-like VC=%@ -> fade", cls]);
+                __weak UIViewController *weakSelf = self;
+                for (NSNumber *d in @[@0.02, @0.2, @0.7]) {
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{
+                        UIViewController *strongSelf = weakSelf;
+                        if (!strongSelf || !splash_adblock_weiboProbeActive()) return;
+                        splash_adblock_fadeTree(strongSelf.view);
+                    });
+                }
+            }
         }
     }
 }
@@ -554,7 +789,8 @@ static inline double splash_adblock_zhiboElapsed(void) {
         // 清理本 App 历史日志，只保留最近 2 份（当前这份是最新的，不会被删）
         splash_adblock_pruneOldLogs();
 
-        // 直播吧：启动双探针（开屏 + 弹窗），其他 App 直接返回
+        // 直播吧：启动弹窗探针；微博：启动开屏 + 弹窗一次性探针。其余 App 内部门控直接返回。
         splash_adblock_zhiboStartProbe();
+        splash_adblock_weiboStartProbe();
     }
 }

@@ -4,7 +4,7 @@
 #import "SplashAdBlockPrivate.h"
 
 // ============================================================================
-// 通用屏蔽插件（v0.4.1）
+// 通用屏蔽插件（v0.4.2）
 //
 // 已精准适配（屏蔽逻辑一行未改）：
 //  · 掌盟 com.tencent.ied.app.lolbible —— 广点通 GDT 开屏（透明化）
@@ -19,8 +19,23 @@
 //  · 铁路12306 cn.12306.rails12306     —— 吞两个数据注入 setter（竞品逆向，已定版）
 //  · 下厨房 com.xiachufang.recipe      —— 揭启动占位窗口 + 倍孜广告 VC 透明 + 启动期
 //                                        拦 openURL 防摇一摇跳转（v0.3.4 验证、v0.3.5 定版）
-//  · 威锋   com.feng.New.WPForumClient —— ADJgSDK 开屏入口吞掉 + 启动期 openURL
-//                                        shield 防摇一摇 + 广告容器兜底透明化（诊断中）
+//  · 威锋   com.feng.New.WPForumClient —— 优量汇 GDT 开屏 VC 透明化 + 走"跳过"dismiss
+//                                        + 启动期 openURL shield 防摇一摇（诊断中）
+//
+// v0.4.2 威锋修正（v0.4.1 真机反馈："广告变成黑屏了"）：
+//  · 日志真相：真正的开屏是优量汇 GDT —— `[wp][present#9] VC=GDTSplashViewController`，
+//    视图树 `GDTSplashDLView(0,0 393x852)` + `UDK_GDTDLRootView`，另一个 root=nil 的裸
+//    window 里是 CQAdBDPassthroughView/UIImageView；ADJgSDK 全程没被调用（只有 hooked，
+//    无 swallow）。t9.0 窗口自己回到 1 个 → 广告约 8~9s 后自行关闭。
+//  · 黑屏根因：GDT 是「全屏 present」。presented 后主界面（MainTabBarController）的 view
+//    已被移出层级，presentation container 是黑底；v0.4.1 只把广告树 alpha=0，露出的就是
+//    黑色 → 看上去"广告变成黑屏"。
+//  · 本版：命中开屏 VC（类名含 splash 语义）时 ①广告树 + 裸 window 立即不可见；
+//    ②0.20s 后对最外层被 present 的那一层 dismissViewControllerAnimated:NO（等价用户点
+//    "跳过"，一次清掉 CQAdBDPresentProxyVC + GDTSplashViewController 整叠），主界面立刻
+//    透出；③0.7s/1.6s 复查补 dismiss、清残留裸 window。不掐 SDK 的 load/show 入口。
+//  · 同时移除 v0.4.1 的七个 tick 采样、视图树 dump 与 window 观察者（定位已完成，
+//    诊断代码不留：无 NSTimer、无 observer，风险面最小）。
 //
 // v0.4.1 威锋修正（v0.4.0 真机反馈："摇一摇没了，但开屏广告又出现了"）：
 //  · 日志证据：`ADJgSDKSplashAd loadAndShowInWindow: hooked` 只有安装那一条，从未出现
@@ -113,12 +128,12 @@ static BOOL splash_adblock_isWPForum(void) {
 }
 
 // ---------- 轻量日志（按需开关，无常驻监听、无轮询） ----------
-#define SPLASH_ADBLOCK_VERSION @"0.4.1"
+#define SPLASH_ADBLOCK_VERSION @"0.4.2"
 
 // 日志默认关闭：已定版 App 每次启动不再生成任何日志文件。
 // 接入新 App 做诊断时，这里临时指向它的 bundle，真机验证通过后**下一版必须改回 NO**。
 // 变更记录：百度地图 v0.3.0 诊断→v0.3.1 定版；12306 v0.3.1 诊断→v0.3.2 定版；
-//          下厨房 v0.3.2~v0.3.4 诊断→v0.3.5 定版；威锋 v0.4.0~v0.4.1 诊断中。
+//          下厨房 v0.3.2~v0.3.4 诊断→v0.3.5 定版；威锋 v0.4.0~v0.4.2 诊断中。
 static BOOL splash_adblock_logEnabled(void) {
     NSString *bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
     return [bundle isEqualToString:@"com.feng.New.WPForumClient"];
@@ -580,15 +595,31 @@ static void splash_adblock_xcfInstallPlaceholderHook(void) {
 }
 %end
 
-#pragma mark - 威锋开屏（ADJgSDK，仅 com.feng.New.WPForumClient 生效）
+#pragma mark - 威锋开屏（优量汇 GDT，仅 com.feng.New.WPForumClient 生效）
 
-// 依据：竞品「威锋去广告.dylib」构造函数反汇编（本仓库
-// _competitor_extract/Library/MobileSubstrate/DynamicLibraries/威锋去广告.dylib）：
-//   objc_getClass("ADJgSDKSplashAd") + MSHookMessageEx(@selector(loadAndShowInWindow:),
-//   replacement) —— replacement 只有一条 ret，即"完全不展示开屏"。
-// 用户反馈的现象是"打开后摇一摇跳转广告"，摇一摇由 ADJgSDK 在开屏生命周期内驱动；
-// 不展示开屏 = 广告 view 与传感器都不会武装。这是竞品实测有效的成熟做法。
-// 另加一道兜底：启动期 15s 内拦 openURL，防止其它 SDK 的摇一摇/自动跳转把用户甩走。
+// v0.4.1 真机日志把真实链路照出来了（v0.4.0 照抄竞品 hook ADJgSDK 是错的）：
+//   [wp][present#9] VC=GDTSplashViewController
+//   [wp][t1.5] win level=0 root=WeiFeng.MainTabBarController
+//              present=WeiFeng.MainTabBarController > GDTSplashViewController
+//   另有一个 root=(null) 的裸 window，里面是 UITransitionView / CQAdBDPassthroughView /
+//   UIImageView + GDTSplashDLView(393x852)。
+//   ADJgSDKSplashAd.loadAndShowInWindow: 全程只有 hooked、没有 swallow → 威锋开屏不是 ADJgSDK，
+//   是优量汇 GDT；t9.0 时窗口自己回到 1 个 → 广告约 8~9s 后自行关闭。
+//
+// v0.4.1 为什么黑屏：只把广告视图树 alpha=0。但 GDT 是「全屏 present」——presented 之后主界面
+// （MainTabBarController）的 view 已被移出层级，presentation container 本身是黑底，
+// 广告透明了，露出来的就是黑色 → 用户看到"广告变成黑屏"。
+//
+// v0.4.2 正解（与直播吧 displayRootViewController、微博 advance 同构：走 App/SDK 自己的收尾）：
+//   ① 命中开屏 VC（类名含 splash 等语义）时：先把广告树 + "裸 window"（rootViewController==nil
+//      的广告载体窗口）整体不可见，避免 0.25s 过渡里闪出广告；
+//   ② 0.20s 后对「最外层被 present 的那一层」调 dismissViewControllerAnimated:NO
+//      —— 等价用户点"跳过"，一次清掉 CQAdBDPresentProxyVC + GDTSplashViewController 整叠，
+//      主界面立刻透出，不再是黑屏；
+//   ③ 0.7s / 1.6s 复查：presentation 动画未结束导致首次 dismiss 失败时补一次，
+//      并清掉残留裸 window；
+//   ④ 启动期 15s 内继续拦 openURL（放行 file:// 与威锋自身 scheme）防摇一摇。
+// 不掐 SDK 的 load/show 入口（回调链完整）；ADJgSDK 的 hook 保留（信息流也可能用），无害。
 // 门控：仅启用开关 + 该 bundle；其它 App 完全 %orig，行为一行不变。
 
 // ---- 启动期 openURL 防护 ----
@@ -637,177 +668,162 @@ static void splash_adblock_wpRevealLaunchWindow(void) {
     }
 }
 
-// ---- v0.4.1 启动期诊断探针（定位真正的开屏容器） ----
-// v0.4.0 的日志证据：`ADJgSDKSplashAd loadAndShowInWindow: hooked` 只有安装那一条，
-// 从未出现 swallow —— 说明 ADJgSDK 根本没被调用，威锋的开屏走的是另一条路径，
-// 而摇一摇不跳只是 openURL shield 挡住了。v0.4.0 只在 2.5s 打了一次窗口清单，
-// 那时只剩主界面 TabBar，什么都没抓到。本版改为连续采样：
-//   · 新 window 变可见立刻采样（事件驱动，限 15 次）
-//   · 0.4/0.9/1.5/2.5/4.0/6.0/9.0s 七个时间点各采样一次
-// 每次打印所有 window 的 level/alpha/root/呈现链/子 VC；判定为可疑的窗口再打视图树。
-// 探针 45s 后自动失效（时间戳比较，无定时器）；观察者 45s 后自动移除。
+// ---- 开屏层处理（v0.4.2：透明化 + 走 SDK 自己的"跳过"路径 dismiss） ----
 
 static NSTimeInterval splash_adblock_wpLaunchTime = 0;
-static NSInteger splash_adblock_wpWindowCount = 0;
 static NSInteger splash_adblock_wpVCCount = 0;
-static id splash_adblock_wpWindowObserver = nil;
 
+static BOOL splash_adblock_wpActive(void) {
+    return splash_adblock_enabled() && splash_adblock_isWPForum();
+}
+
+// 诊断日志窗口：启动后 30s 内记录（时间戳比较，无定时器、无轮询）。
 static BOOL splash_adblock_wpProbeActive(void) {
-    if (!splash_adblock_enabled() || !splash_adblock_isWPForum()) return NO;
+    if (!splash_adblock_wpActive()) return NO;
     NSTimeInterval elapsed = [[NSDate date] timeIntervalSince1970] - splash_adblock_wpLaunchTime;
-    return elapsed >= 0 && elapsed <= 45;
+    return elapsed >= 0 && elapsed <= 30;
 }
 
-// 单个 window 快照：摘要一行；可疑（高 level 或类名命中广告特征）时补视图树。
-static void splash_adblock_wpSnapshotWindow(UIWindow *w, NSString *tag) {
-    if (!w || ![w isKindOfClass:[UIWindow class]]) return;
-    UIViewController *root = w.rootViewController;
-    NSMutableString *chain = [NSMutableString string];
-    UIViewController *vc = root;
-    for (NSInteger i = 0; vc && i < 8; i++) {
-        [chain appendFormat:@"%@ > ", NSStringFromClass([vc class])];
-        UIViewController *next = vc.presentedViewController;
-        if (!next || next == vc) break;
-        vc = next;
-    }
-    NSMutableString *kids = [NSMutableString string];
-    for (UIViewController *c in root.childViewControllers) {
-        [kids appendFormat:@"%@ ", NSStringFromClass([c class])];
-    }
-    BOOL suspicious = (w.windowLevel > 100 && w.windowLevel < 3000)
-        || splash_adblock_zhiboNameLooksLikeAd(NSStringFromClass([root class]))
-        || splash_adblock_zhiboNameLooksLikeAd(chain)
-        || splash_adblock_zhiboNameLooksLikeAd(kids);
-    splash_adblock_log([NSString stringWithFormat:
-        @"[wp][%@] win level=%.0f alpha=%.2f hidden=%d root=%@ present=%@ children=[%@]%@",
-        tag, w.windowLevel, w.alpha, w.isHidden ? 1 : 0, NSStringFromClass([root class]),
-        chain.length ? chain : @"-", kids.length ? kids : @"-",
-        suspicious ? @" <<SUSPICIOUS>>" : @""]);
-    if (!suspicious) return;
-    NSInteger lines = 0;
-    NSMutableString *out = [NSMutableString string];
-    for (UIView *v in w.subviews) splash_adblock_zhiboDumpTree(v, 0, out, &lines);
-    if (out.length) splash_adblock_log(out);
+// 只认「开屏」语义的类名，避免把普通弹窗/详情页 VC 当成开屏 dismiss 掉。
+static BOOL splash_adblock_wpLooksLikeSplash(NSString *name) {
+    if (name.length == 0) return NO;
+    NSString *l = name.lowercaseString;
+    if ([l containsString:@"splash"]) return YES;
+    if ([l containsString:@"launchad"]) return YES;
+    if ([l containsString:@"openscreen"]) return YES;
+    if ([l containsString:@"flashad"]) return YES;
+    if ([l containsString:@"startupad"]) return YES;
+    return NO;
 }
 
-// 兜底：命中广告特征 + 近全屏 + 非 root view 的容器整棵 alpha=0。
-// 只动 alpha，不 hidden、不移除，不碰 SDK 的计时/回调链。
-static void splash_adblock_wpFadeRecursive(UIView *v, UIWindow *win) {
-    if (!v) return;
-    if (![v isEqual:win.rootViewController.view]) {
-        NSString *cls = NSStringFromClass([v class]);
-        CGRect f = v.frame;
-        CGSize s = win.bounds.size;
-        BOOL fullscreen = s.width > 0 && f.size.width >= s.width * 0.8
-                          && f.size.height >= s.height * 0.5;
-        if (fullscreen && splash_adblock_zhiboNameLooksLikeAd(cls)) {
-            splash_adblock_log([NSString stringWithFormat:@"[wp][MATCH] ad view %@ frame=%@ -> fade",
-                                cls, NSStringFromCGRect(f)]);
-            splash_adblock_fadeTree(v);
-            return;
-        }
-    }
-    for (UIView *sub in v.subviews) splash_adblock_wpFadeRecursive(sub, win);
-}
-
-static void splash_adblock_wpFadeAds(void) {
+// 裸 window = rootViewController 为 nil 的广告载体窗口（v0.4.1 日志里的第二个 window）。
+// 只动 level<=0、无 root、非 keyWindow 的；App 自己的窗口与键盘/状态栏一律不碰。
+static void splash_adblock_wpBlankBareWindows(void) {
+    if (!splash_adblock_wpActive()) return;
+    UIWindow *key = [UIApplication sharedApplication].keyWindow;
     for (UIWindow *w in [UIApplication sharedApplication].windows) {
-        CGFloat level = w.windowLevel;
-        if (level > 100 && level < 3000) {
-            NSString *rn = NSStringFromClass([w.rootViewController class]);
-            if (splash_adblock_zhiboNameLooksLikeAd(rn)) {
-                splash_adblock_log([NSString stringWithFormat:
-                    @"[wp][MATCH] high-level window level=%.0f root=%@ -> fade", level, rn]);
-                splash_adblock_fadeTree(w);
-            }
-            continue;
-        }
-        for (UIView *v in w.subviews) splash_adblock_wpFadeRecursive(v, w);
+        if (![w isKindOfClass:[UIWindow class]]) continue;
+        if (w == key) continue;
+        if (w.windowLevel > 0.01) continue;
+        if (w.rootViewController != nil) continue;
+        if (w.isHidden || w.alpha <= 0.01) continue;
+        splash_adblock_fadeTree(w);
+        w.alpha = 0.0;
+        w.userInteractionEnabled = NO;
+        splash_adblock_log(@"[wp] bare ad window -> alpha=0");
     }
 }
 
-// 新 window 出现事件：立刻采样；限 15 次，45s 后自动移除观察者。
-static void splash_adblock_wpStartWindowObserver(void) {
-    splash_adblock_wpWindowObserver =
-        [[NSNotificationCenter defaultCenter] addObserverForName:UIWindowDidBecomeVisibleNotification
-                                                          object:nil
-                                                           queue:[NSOperationQueue mainQueue]
-                                                      usingBlock:^(NSNotification *note) {
-        if (!splash_adblock_wpProbeActive()) return;
-        if (splash_adblock_wpWindowCount >= 15) return;
-        splash_adblock_wpWindowCount++;
-        UIWindow *w = note.object;
-        if (![w isKindOfClass:[UIWindow class]]) return;
-        splash_adblock_log([NSString stringWithFormat:@"[wp][newwin#%ld]", (long)splash_adblock_wpWindowCount]);
-        splash_adblock_wpSnapshotWindow(w, @"newwin");
-        splash_adblock_wpFadeAds();
-    }];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(45 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (splash_adblock_wpWindowObserver) {
-            [[NSNotificationCenter defaultCenter] removeObserver:splash_adblock_wpWindowObserver];
-            splash_adblock_wpWindowObserver = nil;
-            splash_adblock_log(@"[wp] window observer removed");
+// 从最外层被 present 的那一层 dismiss：一次清掉 CQAdBDPresentProxyVC + GDTSplashViewController
+// 整叠（等价用户点"跳过"）。presentation 动画未结束时首次会失败，由 retry 补。
+static void splash_adblock_wpDismissSplash(UIViewController *vc, NSInteger attempt) {
+    if (!vc || !splash_adblock_wpActive()) return;
+    if (vc.view.window == nil) {
+        splash_adblock_log(@"[wp][done] splash layer gone");
+        splash_adblock_wpBlankBareWindows();
+        return;
+    }
+    UIViewController *cursor = vc;
+    UIViewController *outermostPresented = nil;
+    NSInteger guard = 0;
+    while (cursor.presentingViewController && cursor.presentingViewController != cursor && guard++ < 10) {
+        outermostPresented = cursor;
+        cursor = cursor.presentingViewController;
+    }
+    UIViewController *target = outermostPresented ?: vc;
+    @try {
+        if (target.view.window) {
+            splash_adblock_log([NSString stringWithFormat:@"[wp][dismiss#%ld] %@",
+                                (long)attempt, NSStringFromClass([target class])]);
+            [target dismissViewControllerAnimated:NO completion:^{
+                splash_adblock_wpBlankBareWindows();
+            }];
         }
+    } @catch (NSException *e) {
+        splash_adblock_log([NSString stringWithFormat:@"[wp][dismiss] EXCEPTION %@", [e reason] ?: @"?"]);
+    }
+    if (attempt < 3) {
+        NSTimeInterval next = (attempt == 1) ? 0.7 : 1.6;
+        __weak UIViewController *weakVC = vc;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(next * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            splash_adblock_wpDismissSplash(weakVC, attempt + 1);
+        });
+    }
+}
+
+// 命中开屏 VC 的统一入口（present 与 viewDidAppear 两处都调，同一个 VC 只处理一次）。
+static __weak UIViewController *splash_adblock_wpHandledVC = nil;
+
+static void splash_adblock_wpHandleSplashVC(UIViewController *vc, NSString *where) {
+    if (!vc || !splash_adblock_wpActive()) return;
+    if (vc == splash_adblock_wpHandledVC) return;
+    splash_adblock_wpHandledVC = vc;
+    splash_adblock_log([NSString stringWithFormat:@"[wp][MATCH] splash VC=%@ via %@ -> blank + dismiss",
+                        NSStringFromClass([vc class]), where]);
+    splash_adblock_fadeTree(vc.view);
+    splash_adblock_wpBlankBareWindows();
+    __weak UIViewController *weakVC = vc;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.20 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        splash_adblock_wpDismissSplash(weakVC, 1);
     });
 }
 
 static void splash_adblock_wpStartProtection(void) {
-    if (!splash_adblock_enabled() || !splash_adblock_isWPForum()) return;
+    if (!splash_adblock_wpActive()) return;
     splash_adblock_wpShieldUntil = [[NSDate date] timeIntervalSince1970] + 15.0;
     splash_adblock_wpLaunchTime = [[NSDate date] timeIntervalSince1970];
-    splash_adblock_log(@"[wp] active: ADJgSDK swallow + openURL shield 15s + splash probe 45s");
-    // 七个采样点：既做诊断快照，也顺手兜底透明化（命中才动、无命中静默）
-    NSArray *ticks = @[@0.4, @0.9, @1.5, @2.5, @4.0, @6.0, @9.0];
+    splash_adblock_log(@"[wp] active: GDT splash blank+dismiss + openURL shield 15s");
+    // 两个一次性检查：揭掉残存的高 level 启动占位窗口、清掉裸广告窗口（命中才写日志）。
+    NSArray *ticks = @[@1.0, @3.0];
     for (NSNumber *t in ticks) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(t.doubleValue * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             if (!splash_adblock_wpProbeActive()) return;
             splash_adblock_wpRevealLaunchWindow();
-            NSArray *ws = [UIApplication sharedApplication].windows;
-            splash_adblock_log([NSString stringWithFormat:@"[wp][tick %.1f] windows=%lu",
-                                t.doubleValue, (unsigned long)ws.count]);
-            NSString *tag = [NSString stringWithFormat:@"t%.1f", t.doubleValue];
-            for (UIWindow *w in ws) splash_adblock_wpSnapshotWindow(w, tag);
-            splash_adblock_wpFadeAds();
+            splash_adblock_wpBlankBareWindows();
         });
     }
-    splash_adblock_wpStartWindowObserver();
 }
 
-// 开屏入口：不调 orig = 本次不加载/不展示开屏（竞品 replacement 为 ret 的同款做法）。
-// 用 runtime 安装（而非 %hook）：类名不存在时 %hook 会拿到 NULL class，
-// 这里手工检查并把"类/方法是否存在"写进日志，定位更快也更安全。
+// ADJgSDK 开屏入口：v0.4.2 改为「透传 + 兜底」，不再吞掉。
+//  · v0.4.0/v0.4.1 吞掉它（照抄竞品 ret 做法），日志证明它从未被调用——威锋开屏是 GDT。
+//  · 吞掉的风险是"SDK 沉默→没人回调→启动卡住"（下厨房 v0.3.3 的教训），既然没用就别留坑。
+//  · 现在：调原实现，随后 0.3s/1.0s 各做一次裸 window 清理，万一哪天真的走 ADJgSDK 也不会露广告。
+// 用 runtime 安装（而非 %hook）：类名不存在时 %hook 会拿到 NULL class。
 static void (*splash_adblock_wpOrigLoadAndShow)(id, SEL, id) = NULL;
 
 static void splash_adblock_wpLoadAndShow(id self, SEL _cmd, id window) {
-    if (!splash_adblock_enabled() || !splash_adblock_isWPForum()) {
-        if (splash_adblock_wpOrigLoadAndShow) splash_adblock_wpOrigLoadAndShow(self, _cmd, window);
-        return;
-    }
+    if (splash_adblock_wpOrigLoadAndShow) splash_adblock_wpOrigLoadAndShow(self, _cmd, window);
+    if (!splash_adblock_wpActive()) return;
     static dispatch_once_t logOnce;
     dispatch_once(&logOnce, ^{
-        splash_adblock_log(@"[wp][hook] ADJgSDKSplashAd loadAndShowInWindow: -> swallow (no splash, no shake)");
+        splash_adblock_log(@"[wp][hook] ADJgSDKSplashAd loadAndShowInWindow: called -> pass-through + blank");
     });
+    for (NSNumber *d in @[@0.3, @1.0]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            splash_adblock_wpBlankBareWindows();
+            splash_adblock_wpRevealLaunchWindow();
+        });
+    }
 }
 
 static void splash_adblock_wpInstallSplashHook(void) {
-    if (!splash_adblock_enabled() || !splash_adblock_isWPForum()) return;
+    if (!splash_adblock_wpActive()) return;
     Class cls = NSClassFromString(@"ADJgSDKSplashAd");
     if (!cls) {
-        splash_adblock_log(@"[wp][hook] class ADJgSDKSplashAd NOT found (splash may use another SDK)");
+        splash_adblock_log(@"[wp][hook] class ADJgSDKSplashAd not present (splash uses GDT, this is fine)");
         return;
     }
     SEL sel = NSSelectorFromString(@"loadAndShowInWindow:");
     Method m = class_getInstanceMethod(cls, sel);
-    if (!m) {
-        splash_adblock_log(@"[wp][hook] ADJgSDKSplashAd has no loadAndShowInWindow:");
-        return;
-    }
+    if (!m) return;
     if (!splash_adblock_wpOrigLoadAndShow) {
         *(void **)(&splash_adblock_wpOrigLoadAndShow) = (void *)method_getImplementation(m);
         method_setImplementation(m, (IMP)splash_adblock_wpLoadAndShow);
-        splash_adblock_log(@"[wp][hook] ADJgSDKSplashAd loadAndShowInWindow: hooked");
+        splash_adblock_log(@"[wp][hook] ADJgSDKSplashAd loadAndShowInWindow: pass-through installed");
     }
 }
 
@@ -1206,27 +1222,15 @@ static inline double splash_adblock_zhiboElapsed(void) {
         }
     }
 
-    // ---- 威锋：present VC 探针（事件驱动、限 60 次、45s 内） ----
-    // 开屏也可能是 present 出来的全屏 VC，这里记录类名并在命中广告特征时透明化。
-    if (splash_adblock_isWPForum() && vc && splash_adblock_wpProbeActive()
-        && splash_adblock_wpVCCount < 60) {
+    // ---- 威锋：开屏 VC 一 present 就透明化 + dismiss（GDT 全屏 present，见下方说明） ----
+    if (splash_adblock_wpActive() && vc && splash_adblock_wpProbeActive()
+        && splash_adblock_wpVCCount < 40) {
         splash_adblock_wpVCCount++;
         NSString *vcName = NSStringFromClass([vc class]);
         splash_adblock_log([NSString stringWithFormat:@"[wp][present#%ld] VC=%@",
                             (long)splash_adblock_wpVCCount, vcName]);
-        if (splash_adblock_zhiboNameLooksLikeAd(vcName)) {
-            splash_adblock_log([NSString stringWithFormat:@"[wp][MATCH] ad-like present VC=%@ -> fade", vcName]);
-            NSInteger lines = 0;
-            NSMutableString *out = [NSMutableString string];
-            splash_adblock_zhiboDumpTree(vc.view, 0, out, &lines);
-            splash_adblock_log(out);
-            __weak UIViewController *weakVC = vc;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.02 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                UIViewController *strongVC = weakVC;
-                if (!strongVC || !splash_adblock_wpProbeActive()) return;
-                splash_adblock_fadeTree(strongVC.view);
-            });
+        if (splash_adblock_wpLooksLikeSplash(vcName)) {
+            splash_adblock_wpHandleSplashVC(vc, @"present");
         }
     }
 
@@ -1267,27 +1271,14 @@ static inline double splash_adblock_zhiboElapsed(void) {
         splash_adblock_fadeTree(self.view);
     }
 
-    // ---- 威锋：诊断期记录每个出现的 VC 类名（限 60 次），命中广告特征时 dump + fade ----
-    // 用于定位真正的开屏容器（v0.4.0 只 dump 窗口，抓不到 present/child 的 VC）。
-    if (splash_adblock_wpProbeActive() && splash_adblock_wpVCCount < 60) {
+    // ---- 威锋：开屏 VC（present 之外的形态，如 root/child 直接挂载）同样透明化 + dismiss ----
+    if (splash_adblock_wpActive() && splash_adblock_wpProbeActive()
+        && splash_adblock_wpVCCount < 40) {
         splash_adblock_wpVCCount++;
         splash_adblock_log([NSString stringWithFormat:@"[wp][vc#%ld] %@",
                             (long)splash_adblock_wpVCCount, cls]);
-        if (splash_adblock_zhiboNameLooksLikeAd(cls)) {
-            splash_adblock_log([NSString stringWithFormat:@"[wp][MATCH] ad-like VC=%@ -> fade", cls]);
-            NSInteger lines = 0;
-            NSMutableString *out = [NSMutableString string];
-            splash_adblock_zhiboDumpTree(self.view, 0, out, &lines);
-            splash_adblock_log(out);
-            __weak UIViewController *weakSelf = self;
-            for (NSNumber *d in @[@0.02, @0.2, @0.6]) {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{
-                    UIViewController *strongSelf = weakSelf;
-                    if (!strongSelf || !splash_adblock_wpProbeActive()) return;
-                    splash_adblock_fadeTree(strongSelf.view);
-                });
-            }
+        if (splash_adblock_wpLooksLikeSplash(cls)) {
+            splash_adblock_wpHandleSplashVC(self, @"viewDidAppear");
         }
     }
 }

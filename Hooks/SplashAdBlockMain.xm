@@ -4,7 +4,7 @@
 #import "SplashAdBlockPrivate.h"
 
 // ============================================================================
-// 通用屏蔽插件（v0.4.6）
+// 通用屏蔽插件（v0.4.7）
 //
 // 已精准适配（屏蔽逻辑一行未改）：
 //  · 掌盟 com.tencent.ied.app.lolbible —— 广点通 GDT 开屏（透明化）
@@ -19,8 +19,28 @@
 //  · 铁路12306 cn.12306.rails12306     —— 吞两个数据注入 setter（竞品逆向，已定版）
 //  · 下厨房 com.xiachufang.recipe      —— 揭启动占位窗口 + 倍孜广告 VC 透明 + 启动期
 //                                        拦 openURL 防摇一摇跳转（v0.3.4 验证、v0.3.5 定版）
-//  · 威锋   com.feng.New.WPForumClient —— 优量汇 GDT 开屏：断言覆盖式全屏 + 广告窗口/广告树
-//                                        全透明 + 走"跳过"dismiss + 启动期 openURL shield
+//  · 威锋   com.feng.New.WPForumClient —— 优量汇 GDT 开屏：只清广告类视图（不碰主界面容器）
+//                                        + 断言覆盖式全屏 + 走"跳过"dismiss + 启动期 openURL shield
+//
+// v0.4.7 威锋修正（v0.4.6 真机反馈："还是不行"——依然黑屏，且这次日志自己暴露了根因）：
+//  · 日志 55 行，关键四行：
+//      [wp][fade t0.35] UITransitionView {{0,0},{393,852}} a=1.00 big=1 ad=0
+//      [wp][t0.35] subs=[UITransitionView(393x852 a0.00,full)]
+//      [wp][BLACK root-tree] UITransitionView a=0.00 > UIDropShadowView > UILayoutContainerView
+//                            > UITransitionView > UIViewControllerWrapperView > ... + UITabBar
+//    也就是说：**主界面整棵树（tab bar + 导航栈）都装在这个 UITransitionView 里**，
+//    它是 window 的直接子视图，不是 rootViewController.view 本身。v0.4.5/v0.4.6 的
+//    "近全屏就 fade"把这个内容容器当广告压成了 alpha=0 → rootA 仍是 1.00（只有 root
+//    自己没被改），父容器透明 → 整屏全黑。**黑屏是插件自己造成的**，不是 SDK。
+//  · 真正需要清的广告只有：`CQAdBDPassthroughView`×2（窗口级，a=1）和 2.2s 出现的全屏 `UIView`。
+//  · v0.4.7 三条铁律：
+//      ① root view 的**祖先链一律不 fade**（`splash_adblock_wpIsAncestorOfRoot`）——
+//         window 级近全屏子视图只有在"不含 root"时才算广告覆盖层；
+//      ② 所有 fade 都记账（weak 引用 + 原 alpha，上限 600），每轮先撤销祖先链上的误伤
+//         （`splash_adblock_wpUndoFadesAboveRoot`），再清理；
+//      ③ 广告只按**内容级类名**识别（GDT / CQAd / SplashDL），不再按"全屏尺寸"猜。
+//  · 仍保留：recover（dismiss 被 present 的广告 VC / root 被摘出层级时 dismiss 最外层）、
+//    断言 OverFullScreen、启动期 15s openURL shield、每 tick 一行 subs 快照。
 //
 // v0.4.6 威锋修正（v0.4.5 真机反馈："一直黑屏"）：
 //  · 日志只有 18 行、且 t1.60 之后没有任何输出（用户杀了 App）。关键三行：
@@ -179,12 +199,12 @@ static BOOL splash_adblock_isWPForum(void) {
 }
 
 // ---------- 轻量日志（按需开关，无常驻监听、无轮询） ----------
-#define SPLASH_ADBLOCK_VERSION @"0.4.6"
+#define SPLASH_ADBLOCK_VERSION @"0.4.7"
 
 // 日志默认关闭：已定版 App 每次启动不再生成任何日志文件。
 // 接入新 App 做诊断时，这里临时指向它的 bundle，真机验证通过后**下一版必须改回 NO**。
 // 变更记录：百度地图 v0.3.0 诊断→v0.3.1 定版；12306 v0.3.1 诊断→v0.3.2 定版；
-//          下厨房 v0.3.2~v0.3.4 诊断→v0.3.5 定版；威锋 v0.4.0~v0.4.6 诊断中。
+//          下厨房 v0.3.2~v0.3.4 诊断→v0.3.5 定版；威锋 v0.4.0~v0.4.7 诊断中。
 static BOOL splash_adblock_logEnabled(void) {
     NSString *bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
     return [bundle isEqualToString:@"com.feng.New.WPForumClient"];
@@ -822,41 +842,34 @@ static BOOL splash_adblock_wpTreeHasAdView(UIView *v, NSInteger depth) {
     return NO;
 }
 
-// 命中广告视图时，把它"最外层的广告祖先"（顶到 topLevel 的下一层，但不越过 protect）
-// 整棵透明化 —— 避免广告容器自己铺黑底。
-static NSInteger splash_adblock_wpHideAdViews(UIView *v, UIView *protect, UIView *topLevel) {
-    if (!v || v == protect) return 0;
-    if (splash_adblock_wpViewLooksLikeAdView(v)) {
-        UIView *container = v;
-        while (container.superview && container.superview != topLevel
-               && container.superview != protect) {
-            container = container.superview;
-        }
-        splash_adblock_fadeTree(container);
-        return 1;
-    }
-    NSInteger hits = 0;
-    for (UIView *sub in [v.subviews copy]) {
-        hits += splash_adblock_wpHideAdViews(sub, protect, topLevel);
-    }
-    return hits;
-}
-
-// ---- v0.4.6：主界面"被压住/被摘掉"的判定与恢复 ----
-// v0.4.5 日志证据（18 行）：主窗口 root=MainTabBarController alpha=1.00 hidden=0，
-// 但 `[wp][sweep t0.35] hits=1`、`t1.10/t1.60 hits=2` 且只有 1 个窗口 →
-// 广告层不是独立 window，而是**压在主窗口 root view 上面**的不透明全屏子视图；
-// 只把它们 fade 会让 alpha 回到 0，但主界面到底在哪一层并没有保证。
-// 所以这一版不再"只透明化"，而是**主动把主界面重新摆到最上层**：
-//   · root view 被摘出层级（FullScreen present 的典型结果）→ dismiss 最上层 present；
-//   · root view 还在层级里但被不透明全屏层压着 → fade 那层 + bringSubviewToFront(rootView)；
-//   · root view 自身 alpha 被改小/被 hidden → 复位成 alpha=1、hidden=NO。
-// 只动 alpha 与兄弟视图顺序，不 hidden、不移除、不碰 SDK 的计时与回调。
+// ---- v0.4.7：只压广告，绝不压主界面容器 ----
+// v0.4.6 日志（55 行）直接给出了黑屏根因，是我们自己造成的：
+//   [wp][fade t0.35] UITransitionView {{0,0},{393,852}} a=1.00 big=1 ad=0
+//   [wp][t0.35] subs=[UITransitionView(393x852 a0.00,full)]
+//   root-tree: UITransitionView a=0.00 > UIDropShadowView > UILayoutContainerView
+//              > UITransitionView > UIViewControllerWrapperView ... + UITabBar
+// 也就是说：**主界面整棵树（tab bar + 导航栈）都装在这个 UITransitionView 里**，
+// 而它是 window 的直接子视图，并不是 rootViewController.view 本身。
+// 旧逻辑只要"近全屏"就 fade，把这个内容容器当广告压成了 alpha=0 →
+// rootA 仍是 1.00（只有 root 自己没被改），但父容器透明 → 整屏全黑。
+// 真正的广告只有 CQAdBDPassthroughView ×2 和后来出现的全屏 UIView。
+//
+// 本版三条铁律：
+//   ① root view 的**祖先链一律不动**（`isAncestorOfRoot` 判定），fade 只作用于广告视图；
+//   ② 所有 fade 都记账（weak 引用 + 原 alpha），下一轮先"撤销误伤"再清理；
+//   ③ 只按内容识别广告类（GDT / CQAd / SplashDL），不再按"全屏尺寸"猜。
 
 static BOOL splash_adblock_wpRootInWindow(UIWindow *w) {
     if (!w || !w.rootViewController) return NO;
     UIView *rv = w.rootViewController.view;
     return rv != nil && rv.window == w;
+}
+
+// v 是不是 rootView 的祖先（含 window 级容器）。是就绝对不能 fade。
+static BOOL splash_adblock_wpIsAncestorOfRoot(UIView *v, UIView *rootView) {
+    if (!v || !rootView) return NO;
+    if (v == rootView) return YES;
+    return [rootView isDescendantOfView:v];
 }
 
 // 窗口直接子视图摘要（一行看清上面压了哪几层、谁是 root）。
@@ -874,6 +887,59 @@ static NSString *splash_adblock_wpSubsSummary(UIWindow *w, UIView *rootView) {
     return s.length ? s : @"(empty)";
 }
 
+// ---- 带记账的 fade：只动 alpha，可撤销 ----
+// 上限 600 条；撤销时按"是否是 root 的祖先（含 root 自身）"分流：
+// 属于祖先链的立刻还原 alpha，其余保留（那些是广告，本来就该保持透明）。
+static NSMutableArray *splash_adblock_wpFadedRefs = nil;
+static NSMutableArray *splash_adblock_wpFadedAlphas = nil;
+
+static void splash_adblock_wpFadeRecorded(UIView *v) {
+    if (!v) return;
+    if (v.alpha > 0.01) {
+        if (!splash_adblock_wpFadedRefs) {
+            splash_adblock_wpFadedRefs = [NSMutableArray array];
+            splash_adblock_wpFadedAlphas = [NSMutableArray array];
+        }
+        if (splash_adblock_wpFadedRefs.count >= 600) {
+            [splash_adblock_wpFadedRefs removeAllObjects];
+            [splash_adblock_wpFadedAlphas removeAllObjects];
+        }
+        [splash_adblock_wpFadedRefs addObject:[NSValue valueWithNonretainedObject:v]];
+        [splash_adblock_wpFadedAlphas addObject:@(v.alpha)];
+    }
+    v.alpha = 0.0;
+    for (UIView *sub in v.subviews) splash_adblock_wpFadeRecorded(sub);
+}
+
+static NSInteger splash_adblock_wpUndoFadesAboveRoot(UIView *rootView) {
+    if (!rootView || splash_adblock_wpFadedRefs.count == 0) return 0;
+    NSMutableArray *keepRefs = [NSMutableArray array];
+    NSMutableArray *keepAlphas = [NSMutableArray array];
+    NSInteger restored = 0;
+    NSUInteger n = splash_adblock_wpFadedRefs.count;
+    for (NSUInteger i = 0; i < n; i++) {
+        UIView *v = [splash_adblock_wpFadedRefs[i] nonretainedObjectValue];
+        if (!v) continue;
+        if (splash_adblock_wpIsAncestorOfRoot(v, rootView)) {
+            CGFloat a = [splash_adblock_wpFadedAlphas[i] doubleValue];
+            if (v.alpha < a - 0.001) {
+                v.alpha = a;
+                restored++;
+            }
+        } else {
+            [keepRefs addObject:splash_adblock_wpFadedRefs[i]];
+            [keepAlphas addObject:splash_adblock_wpFadedAlphas[i]];
+        }
+    }
+    splash_adblock_wpFadedRefs = keepRefs;
+    splash_adblock_wpFadedAlphas = keepAlphas;
+    if (restored > 0) {
+        splash_adblock_log([NSString stringWithFormat:
+            @"[wp][UNDO] restored %ld view(s) on main-content chain", (long)restored]);
+    }
+    return restored;
+}
+
 static NSInteger splash_adblock_wpRecoverCount = 0;
 static BOOL splash_adblock_wpBlackDumped = NO;
 
@@ -885,10 +951,9 @@ static void splash_adblock_wpDumpBlackContext(UIWindow *main, NSString *why) {
     splash_adblock_wpBlackDumped = YES;
     UIView *rv = main.rootViewController.view;
     splash_adblock_log([NSString stringWithFormat:
-        @"[wp][BLACK %@] key=%d level=%.0f a=%.2f rootInWin=%d rootA=%.2f rootHidden=%d rootClips=%d subs=[%@]",
+        @"[wp][BLACK %@] key=%d level=%.0f a=%.2f rootInWin=%d rootA=%.2f rootHidden=%d subs=[%@]",
         why, main.isKeyWindow ? 1 : 0, main.windowLevel, main.alpha,
         splash_adblock_wpRootInWindow(main) ? 1 : 0, rv.alpha, rv.isHidden ? 1 : 0,
-        rv.clipsToBounds ? 1 : 0,
         splash_adblock_wpSubsSummary(main, rv)]);
     NSInteger lines = 0;
     NSMutableString *out = [NSMutableString stringWithString:@"[wp][BLACK root-tree]\n"];
@@ -897,7 +962,7 @@ static void splash_adblock_wpDumpBlackContext(UIWindow *main, NSString *why) {
 }
 
 // VC 树里找"广告载体 VC 的 present 链"：present 可能发生在 tab 里的子 VC 上，
-// 这时 root view 仍留在窗口层级里（rootInWin=1），黑底来自 child 的 presentation container。
+// 这时 root view 仍留在窗口层级里，黑底来自 child 的 presentation container。
 static UIViewController *splash_adblock_wpFindPresentedAd(UIViewController *vc, NSInteger depth) {
     if (!vc || depth > 4) return nil;
     UIViewController *p = vc.presentedViewController;
@@ -918,12 +983,18 @@ static UIViewController *splash_adblock_wpFindPresentedAd(UIViewController *vc, 
     return nil;
 }
 
-// 主界面恢复。返回 YES 表示这次做了动作（dismiss 或 提层/复位）。
+// 主界面恢复。返回 YES 表示这次做了动作。
+// 注意：**不再** fade root 的祖先容器、也不靠 bringSubviewToFront（root 常被嵌在
+// UITransitionView 里，提层无意义且会打乱层级）。
 static BOOL splash_adblock_wpRecoverMain(UIWindow *main, NSString *why) {
     if (!main || !main.rootViewController) return NO;
     UIView *rootView = main.rootViewController.view;
     if (!rootView) return NO;
 
+    // ① 先撤销历史上被误伤的内容容器（v0.4.6 把 UITransitionView 压成 0 的后果）
+    NSInteger undone = splash_adblock_wpUndoFadesAboveRoot(rootView);
+
+    // ② root view 被 FullScreen present 摘出层级 → dismiss 最外层 present
     if (!splash_adblock_wpRootInWindow(main)) {
         UIViewController *cursor = main.rootViewController;
         UIViewController *top = nil;
@@ -934,7 +1005,7 @@ static BOOL splash_adblock_wpRecoverMain(UIWindow *main, NSString *why) {
         }
         if (!top || splash_adblock_wpRecoverCount >= 4) {
             splash_adblock_wpDumpBlackContext(main, why);
-            return NO;
+            return undone > 0;
         }
         splash_adblock_wpRecoverCount++;
         splash_adblock_log([NSString stringWithFormat:
@@ -950,49 +1021,17 @@ static BOOL splash_adblock_wpRecoverMain(UIWindow *main, NSString *why) {
         return YES;
     }
 
-    // root view 在层级里：清掉压在它上面的不透明全屏层，再把 root 提到最前。
-    CGSize ws = main.bounds.size;
-    NSArray *subs = [main.subviews copy];
-    NSUInteger rootIdx = NSNotFound;
-    for (NSUInteger i = 0; i < subs.count; i++) {
-        if (subs[i] == rootView) { rootIdx = i; break; }
-    }
-    BOOL faded = NO;
-    if (rootIdx != NSNotFound) {
-        for (NSUInteger i = rootIdx + 1; i < subs.count; i++) {
-            UIView *sub = subs[i];
-            CGSize fs = sub.frame.size;
-            BOOL full = ws.width > 0 && fs.width >= ws.width * 0.9 && fs.height >= ws.height * 0.9;
-            if (!full || sub.alpha <= 0.01) continue;
-            splash_adblock_log([NSString stringWithFormat:
-                @"[wp][RECOVER %@ #%ld] overlay above root: %@ a=%.2f -> fade + front",
-                why, (long)(splash_adblock_wpRecoverCount + 1), NSStringFromClass([sub class]), sub.alpha]);
-            splash_adblock_fadeTree(sub);
-            faded = YES;
-        }
-    }
+    // ③ root 自身 alpha 被改坏 → 复位（祖先链已在 ① 处理）
     BOOL fixedRoot = NO;
     if (rootView.alpha <= 0.01) { rootView.alpha = 1.0; fixedRoot = YES; }
     if (rootView.isHidden) { rootView.hidden = NO; fixedRoot = YES; }
-    // root view 被改成小尺寸/移出屏幕也会表现为"黑屏"，只在明显不对时复位。
-    if (ws.width > 0 && (rootView.frame.size.width < ws.width * 0.5
-                         || rootView.frame.size.height < ws.height * 0.5)) {
-        splash_adblock_log([NSString stringWithFormat:
-            @"[wp][RECOVER %@] root frame %@ -> bounds %@", why,
-            NSStringFromCGRect(rootView.frame), NSStringFromCGRect(main.bounds)]);
-        rootView.frame = main.bounds;
-        fixedRoot = YES;
-    }
-    if (faded || fixedRoot) {
-        if (subs.lastObject != rootView) [main bringSubviewToFront:rootView];
-        if (splash_adblock_wpRecoverCount < 4) splash_adblock_wpRecoverCount++;
-        if (splash_adblock_wpRecoverCount >= 2) splash_adblock_wpDumpBlackContext(main, why);
+    if (fixedRoot) {
+        splash_adblock_log([NSString stringWithFormat:@"[wp][RECOVER %@] root alpha/hidden restored", why]);
         return YES;
     }
-    // 情况三：root 在层级里、也没有窗口级覆盖层，但 tab/导航的子 VC 上 present 了广告代理 VC
-    // （日志里 CQAdBDPresentProxyVC 有 viewDidAppear、却没有任何 present 记录，正是这种）。
-    // 这时黑底来自 child 的 presentation container，必须 dismiss 掉才会露出主界面。
-    if (!faded && !fixedRoot && splash_adblock_wpRecoverCount < 4) {
+
+    // ④ tab/导航的子 VC 上 present 了广告代理 VC（CQAdBDPresentProxyVC 就是这种）→ dismiss
+    if (splash_adblock_wpRecoverCount < 4) {
         UIViewController *adVC = splash_adblock_wpFindPresentedAd(main.rootViewController, 0);
         if (adVC) {
             splash_adblock_wpRecoverCount++;
@@ -1009,19 +1048,43 @@ static BOOL splash_adblock_wpRecoverMain(UIWindow *main, NSString *why) {
             return YES;
         }
     }
-    // 没有可疑层：只有 root 显著偏暗（半透明盖着）时也取证一次。
-    if (rootView.alpha < 0.95) splash_adblock_wpDumpBlackContext(main, why);
-    return NO;
+    return undone > 0;
 }
 
-// 一次清扫：非主窗口整层 → 窗口级覆盖子视图 → 主窗口 root 内部的广告子树 → 主界面恢复。
-// 诊断期每个 tick 打一行摘要（能看清"哪一层压着"）；命中才额外打 fade 明细。
-// 只动 alpha / 交互 / 兄弟顺序，不 hidden、不移除，SDK 计时与回调链不受影响。
+// 广告视图清理：只在"广告类名"命中时动手，且绝不越过 root view 的祖先链。
+// 若某个广告视图的祖先恰好是 root 的祖先容器（同一个 UITransitionView），
+// 则只 fade 这个广告视图本身，保住内容容器。
+static NSInteger splash_adblock_wpHideAdViews(UIView *v, UIView *rootView, UIView *topLevel, NSInteger depth) {
+    if (!v || depth > 14) return 0;
+    if (v == rootView) return 0;                           // 主界面整棵子树不碰
+    if (splash_adblock_wpViewLooksLikeAdView(v)) {
+        UIView *container = v;
+        while (container.superview && container.superview != topLevel) {
+            if (splash_adblock_wpIsAncestorOfRoot(container.superview, rootView)) break;
+            container = container.superview;
+        }
+        splash_adblock_log([NSString stringWithFormat:
+            @"[wp][MATCH] ad view %@ -> fade container %@",
+            NSStringFromClass([v class]), NSStringFromClass([container class])]);
+        splash_adblock_wpFadeRecorded(container);
+        return 1;
+    }
+    NSInteger hits = 0;
+    for (UIView *sub in [v.subviews copy]) {
+        hits += splash_adblock_wpHideAdViews(sub, rootView, topLevel, depth + 1);
+    }
+    return hits;
+}
+
+// 一次清扫：只清广告（内容级识别），然后确认主界面可见。
+//   · 非主窗口若是广告载体 → 整窗 alpha=0 + 关交互；
+//   · 主窗口里"不含 root view 的近全屏窗口级子视图"（presentation 容器/遮罩）→ fade；
+//     **含 root view 的（即主界面容器）一律跳过** —— 这是 v0.4.6 黑屏的根源；
+//   · 整棵树按类名找广告视图，命中就 fade 它自己或它的非 root 祖先容器。
 static NSInteger splash_adblock_wpSweep(NSString *why) {
     if (!splash_adblock_wpActive()) return 0;
     UIWindow *main = splash_adblock_wpMainWindow();
     NSInteger hits = 0;
-    NSInteger fadeLogs = 0;
     for (UIWindow *w in [UIApplication sharedApplication].windows) {
         if (![w isKindOfClass:[UIWindow class]]) continue;
         if (w.windowLevel > 100) continue;                // 键盘/状态栏/系统弹层不碰
@@ -1045,31 +1108,23 @@ static NSInteger splash_adblock_wpSweep(NSString *why) {
         }
         CGSize ws = w.bounds.size;
         for (UIView *sub in [w.subviews copy]) {
-            if (rootView && (sub == rootView || [sub isDescendantOfView:rootView])) continue;
+            // 主界面所在的容器链：绝不 fade（v0.4.6 就是在这里把 UITransitionView 压黑的）
+            if (splash_adblock_wpIsAncestorOfRoot(sub, rootView)) {
+                hits += splash_adblock_wpHideAdViews(sub, rootView, w, 0);
+                continue;
+            }
             CGRect f = sub.frame;
-            // 只压「近全屏的窗口级覆盖层」（presentation 容器/遮罩/海报）或「含广告渲染视图」的层，
-            // 小尺寸的 HUD/提示不动，避免误伤 App 自己的 loading。
             BOOL big = ws.width > 0 && f.size.width >= ws.width * 0.8 && f.size.height >= ws.height * 0.5;
             BOOL adish = splash_adblock_wpTreeHasAdView(sub, 0);
             if (big || adish) {
-                if (sub.alpha > 0.01) {
-                    hits++;
-                    if (fadeLogs < 6) {
-                        fadeLogs++;
-                        splash_adblock_log([NSString stringWithFormat:
-                            @"[wp][fade %@] %@ %@ a=%.2f big=%d ad=%d",
-                            why, NSStringFromClass([sub class]), NSStringFromCGRect(f),
-                            sub.alpha, big ? 1 : 0, adish ? 1 : 0]);
-                    }
-                }
-                splash_adblock_fadeTree(sub);
+                splash_adblock_log([NSString stringWithFormat:
+                    @"[wp][fade %@] %@ %@ a=%.2f big=%d ad=%d",
+                    why, NSStringFromClass([sub class]), NSStringFromCGRect(f),
+                    sub.alpha, big ? 1 : 0, adish ? 1 : 0]);
+                if (sub.alpha > 0.01) hits++;
+                splash_adblock_wpFadeRecorded(sub);
             } else {
-                hits += splash_adblock_wpHideAdViews(sub, nil, w);
-            }
-        }
-        if (isMain && rootView) {
-            for (UIView *sub in [rootView.subviews copy]) {
-                hits += splash_adblock_wpHideAdViews(sub, nil, rootView);
+                hits += splash_adblock_wpHideAdViews(sub, rootView, w, 0);
             }
         }
     }
@@ -1078,7 +1133,7 @@ static NSInteger splash_adblock_wpSweep(NSString *why) {
         [main makeKeyWindow];
         splash_adblock_log(@"[wp] key window returned to main");
     }
-    // 关键一步：不管上面清了几层，都要确认主界面真的在看得见的位置。
+    // 不管上面清了几层，都要确认主界面真的在看得见的位置。
     if (main) (void)splash_adblock_wpRecoverMain(main, why);
     if (main && splash_adblock_wpProbeActive()) {
         UIView *rv = main.rootViewController.view;
@@ -1188,7 +1243,7 @@ static void splash_adblock_wpStartProtection(void) {
     if (!splash_adblock_wpActive()) return;
     splash_adblock_wpShieldUntil = [[NSDate date] timeIntervalSince1970] + 15.0;
     splash_adblock_wpLaunchTime = [[NSDate date] timeIntervalSince1970];
-    splash_adblock_log(@"[wp] active: GDT sweep + main-window recover 0.35~9.5s + openURL shield 15s");
+    splash_adblock_log(@"[wp] active: GDT ad-only sweep 0.35~9.5s + recover + openURL shield 15s");
     splash_adblock_wpScheduleSweeps();
 }
 

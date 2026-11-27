@@ -100,6 +100,15 @@
 - (void)viewDidLayoutSubviews;
 @end
 
+// -------- 威锋开屏（ADJgSDK，竞品「威锋去广告.dylib」构造函数反汇编确认）--------
+// 竞品 constructor 三次 MSHookMessageEx：
+//   ADJgSDKNativeAd              -pollingHandleIsValid:  -> ret0 (BOOL NO)
+//   ADJgSDKNativeAdPollingHandle -setNativeAd: / -setNativeAdViewArray: -> ret
+//   ADJgSDKSplashAd              -loadAndShowInWindow:   -> ret  ← 开屏入口（本插件只做这一条）
+// 吞掉 loadAndShowInWindow: 等价"本次不展示开屏"，摇一摇传感器挂在开屏链上，一并消失。
+// 实现上用 runtime 安装（NSClassFromString + method_setImplementation），
+// 因此这里不需要 @interface 声明；类/方法是否存在由安装函数检查并写日志。
+
 // -------- 评分弹窗 --------
 // 系统原生评分控制器（iOS 10.3+）。前向声明避免依赖 StoreKit 框架。
 @interface SKStoreReviewController : NSObject

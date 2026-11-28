@@ -4,9 +4,9 @@
 #import "SplashAdBlockPrivate.h"
 
 // ============================================================================
-// 通用屏蔽插件（v0.5.1）
+// 通用屏蔽插件（v0.5.2）
 //
-// 已精准适配（屏蔽逻辑一行未改）：
+// 已精准适配（v0.5.1 之前的屏蔽逻辑一行未改）：
 //  · 掌盟 com.tencent.ied.app.lolbible —— 广点通 GDT 开屏（透明化）
 //  · 闪联 com.shanlian.pro             —— 评分弹窗
 //  · 什么值得买 com.smzdm.client.ios   —— SMFullWindowAdView 开屏（精准透明化）
@@ -23,6 +23,13 @@
 //                                        容器挡住（不动 alpha，保住曝光判定）+ tick 兜底
 //                                        + 断言覆盖式全屏 + 走"跳过"dismiss
 //                                        + 启动期 openURL/App Store 页拦截（v0.5.1 定版）
+//  · 京东   com.360buy.jdmobile         —— v0.5.2 诊断中：偶发开屏广告，先取证不屏蔽。
+//                                        日志 6 槽位循环覆盖（保留"有广告那次"）。
+//
+// v0.5.2 京东诊断（用户反馈"打开有广告，但不是每次都有"）：
+//  · plist 新增 com.360buy.jdmobile；日志白名单临时指向京东；
+//  · 只做探针：窗口快照/present/appear/加子视图/类名与方法签名，20s 封顶、不改 UI；
+//  · 定版后必须：关日志、删整个 jd 探针、清 6 个槽位日志。
 //
 // v0.5.1 定版（v0.5.0 真机确认"可以了"）：
 //  · 威锋移出日志白名单（logEnabled 直接 return NO），启动清空沙盒内历史日志；
@@ -259,15 +266,22 @@ static BOOL splash_adblock_isWPForum(void) {
     return [b isEqualToString:@"com.feng.New.WPForumClient"];
 }
 
+static BOOL splash_adblock_isJD(void) {
+    NSString *b = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+    return [b isEqualToString:@"com.360buy.jdmobile"];
+}
+
 // ---------- 轻量日志（按需开关，无常驻监听、无轮询） ----------
-#define SPLASH_ADBLOCK_VERSION @"0.5.1"
+#define SPLASH_ADBLOCK_VERSION @"0.5.2"
 
 // 日志默认关闭：已定版 App 每次启动不再生成任何日志文件。
 // 接入新 App 做诊断时，这里临时指向它的 bundle，真机验证通过后**下一版必须改回 NO**。
 // 变更记录：百度地图 v0.3.0 诊断→v0.3.1 定版；12306 v0.3.1 诊断→v0.3.2 定版；
-//          下厨房 v0.3.2~v0.3.4 诊断→v0.3.5 定版；威锋 v0.4.0~v0.5.0 诊断→v0.5.1 定版。
+//          下厨房 v0.3.2~v0.3.4 诊断→v0.3.5 定版；威锋 v0.4.0~v0.5.0 诊断→v0.5.1 定版；
+//          京东 v0.5.2 诊断中（偶发开屏广告，需多次冷启动取证）。
 static BOOL splash_adblock_logEnabled(void) {
-    return NO;
+    NSString *bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+    return [bundle isEqualToString:@"com.360buy.jdmobile"];
 }
 
 // 本次会话的唯一标志（版本号 + 启动时间戳），进程内只生成一次。
@@ -297,9 +311,37 @@ static NSString *splash_adblock_logTag(void) {
     return tag;
 }
 
+// v0.5.2 京东专用：偶发广告必须保留"有广告那一次"的证据，固定单文件会被后续
+// 正常启动覆盖掉。改为 6 个固定槽位循环覆盖（选 mtime 最旧的那个），总数恒定 6，
+// 不无限累积；定版时 pruneOldLogs 会把它们全部清掉。
+static NSString *splash_adblock_jdSlotName(void) {
+    static NSString *cached = nil;
+    if (cached) return cached;
+    NSArray *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    NSString *dir = docs.firstObject ?: @"/tmp";
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *oldest = @"SplashAdBlock_jd_1.log";
+    NSDate *oldestDate = nil;
+    BOOL emptySlot = NO;
+    for (NSInteger i = 1; i <= 6; i++) {
+        NSString *n = [NSString stringWithFormat:@"SplashAdBlock_jd_%ld.log", (long)i];
+        NSString *p = [dir stringByAppendingPathComponent:n];
+        NSDictionary *attr = [fm attributesOfItemAtPath:p error:nil];
+        NSDate *d = attr[NSFileModificationDate];
+        if (!d) { cached = n; emptySlot = YES; break; }
+        if (!oldestDate || [d compare:oldestDate] == NSOrderedAscending) {
+            oldestDate = d;
+            oldest = n;
+        }
+    }
+    if (!emptySlot) cached = oldest;
+    return cached;
+}
+
 // v0.1.9：固定单文件名，覆盖写——不再每次启动生成一个新文件（用户反馈日志累积）。
 // 可追溯性改由「首行内容」承载：版本 + 时间戳 stamp + bundle 都写在第一行。
 static NSString *splash_adblock_logName(void) {
+    if (splash_adblock_isJD()) return splash_adblock_jdSlotName();
     return [NSString stringWithFormat:@"SplashAdBlock_%@.log", splash_adblock_logTag()];
 }
 
@@ -367,6 +409,8 @@ static void splash_adblock_pruneOldLogs(void) {
     for (NSString *dir in dirs) {
         for (NSString *f in [fm contentsOfDirectoryAtPath:dir error:nil]) {
             if (![f hasPrefix:prefix] || ![f hasSuffix:@".log"]) continue;
+            // 京东诊断期：6 个槽位都要留着（"有广告那次"的证据不能被后续启动冲掉）。
+            if (splash_adblock_isJD() && [f hasPrefix:@"SplashAdBlock_jd_"]) continue;
             // 日志关闭：全部删除；日志开启：删历史，保留当前固定文件（下面会截断）。
             if (enabled && [f isEqualToString:current]) continue;
             [fm removeItemAtPath:[dir stringByAppendingPathComponent:f] error:nil];
@@ -1413,6 +1457,155 @@ static void splash_adblock_wpInstallSplashHook(void) {
 // 摇一摇跳转拦截（下厨房 + 威锋共用一个拦截器）：
 // 只在各自的 shield 窗口内、只拦"离开本 App"的 URL；
 // 放行 file:// 与各自 App 的自身 scheme，避免影响 App 内部跳转。
+#pragma mark - 京东：偶发开屏广告诊断探针（v0.5.2 临时，定版必须整体移除）
+
+// 京东"不是每次打开都有广告"——先只取证、不改任何 UI。
+// 严格封顶：20s 后自动失效；6 次窗口快照；70 条加子视图；60 条 present；60 条 VC；
+// 类名只 dump 一次（objc_copyClassList / class_copyMethodList 全部配对 free）。
+// 无 NSTimer、无观察者、无常驻轮询；全部是一次性 dispatch_after，11s 结束。
+
+static NSTimeInterval splash_adblock_jdLaunchTime = 0;
+static NSInteger splash_adblock_jdAddCount = 0;
+static NSInteger splash_adblock_jdPresentCount = 0;
+static NSInteger splash_adblock_jdAppearCount = 0;
+static NSInteger splash_adblock_jdDumpCount = 0;
+static BOOL splash_adblock_jdClassDumped = NO;
+
+static BOOL splash_adblock_jdProbeActive(void) {
+    if (!splash_adblock_enabled() || !splash_adblock_isJD()) return NO;
+    if (splash_adblock_jdLaunchTime <= 0) {
+        splash_adblock_jdLaunchTime = [[NSDate date] timeIntervalSince1970];
+    }
+    return ([[NSDate date] timeIntervalSince1970] - splash_adblock_jdLaunchTime) < 20.0;
+}
+
+static BOOL splash_adblock_jdNameLooksLikeAd(NSString *n) {
+    if (!n) return NO;
+    NSString *l = [n lowercaseString];
+    NSArray *keys = @[@"splash", @"flash", @"startup", @"launchad", @"openad",
+                      @"adview", @"adsdk", @"gdt", @"csj", @"pangolin",
+                      @"bumble", @"jdads", @"jdsplash", @"screenad"];
+    for (NSString *k in keys) {
+        if ([l rangeOfString:k].location != NSNotFound) return YES;
+    }
+    return NO;
+}
+
+static NSString *splash_adblock_jdBrief(UIView *v) {
+    if (!v) return @"(nil)";
+    return [NSString stringWithFormat:@"%@ f=%@ a=%.2f h=%d",
+            NSStringFromClass([v class]), NSStringFromCGRect(v.frame), v.alpha, v.hidden ? 1 : 0];
+}
+
+static void splash_adblock_jdOnAddSubview(UIWindow *w, UIView *v) {
+    if (!splash_adblock_jdProbeActive() || splash_adblock_jdAddCount >= 70) return;
+    splash_adblock_jdAddCount++;
+    splash_adblock_log([NSString stringWithFormat:@"[jd][add #%ld] win=%@ %@",
+        (long)splash_adblock_jdAddCount, NSStringFromClass([w class]), splash_adblock_jdBrief(v)]);
+}
+
+static void splash_adblock_jdOnPresent(UIViewController *vc) {
+    if (!vc || !splash_adblock_jdProbeActive() || splash_adblock_jdPresentCount >= 60) return;
+    splash_adblock_jdPresentCount++;
+    NSString *n = NSStringFromClass([vc class]);
+    splash_adblock_log([NSString stringWithFormat:@"[jd][present #%ld] VC=%@ %@%@",
+        (long)splash_adblock_jdPresentCount, n, splash_adblock_jdBrief(vc.view),
+        splash_adblock_jdNameLooksLikeAd(n) ? @"  <<< AD-LIKE" : @""]);
+}
+
+static void splash_adblock_jdOnAppear(UIViewController *vc) {
+    if (!vc || !splash_adblock_jdProbeActive() || splash_adblock_jdAppearCount >= 60) return;
+    splash_adblock_jdAppearCount++;
+    NSString *n = NSStringFromClass([vc class]);
+    splash_adblock_log([NSString stringWithFormat:@"[jd][appear #%ld] VC=%@ %@%@",
+        (long)splash_adblock_jdAppearCount, n, splash_adblock_jdBrief(vc.view),
+        splash_adblock_jdNameLooksLikeAd(n) ? @"  <<< AD-LIKE" : @""]);
+}
+
+static void splash_adblock_jdDumpWindows(NSString *why) {
+    if (!splash_adblock_jdProbeActive() || splash_adblock_jdDumpCount >= 6) return;
+    splash_adblock_jdDumpCount++;
+    for (UIWindow *w in [[UIApplication sharedApplication] windows]) {
+        splash_adblock_log([NSString stringWithFormat:
+            @"[jd][win %@] %@ level=%.0f key=%d root=%@ f=%@ a=%.2f h=%d",
+            why, NSStringFromClass([w class]), w.windowLevel, w.isKeyWindow ? 1 : 0,
+            NSStringFromClass([w.rootViewController class]) ?: @"(nil)",
+            NSStringFromCGRect(w.frame), w.alpha, w.hidden ? 1 : 0]);
+        NSInteger subs = 0;
+        for (UIView *sub in [w.subviews copy]) {
+            if (subs++ >= 5) break;
+            splash_adblock_log([NSString stringWithFormat:@"[jd][  sub %@] %@", why,
+                                splash_adblock_jdBrief(sub)]);
+            NSInteger inner = 0;
+            for (UIView *s2 in [sub.subviews copy]) {
+                if (inner++ >= 3) break;
+                splash_adblock_log([NSString stringWithFormat:@"[jd][    in %@] %@", why,
+                                    splash_adblock_jdBrief(s2)]);
+            }
+        }
+    }
+}
+
+// 类名 + 方法签名：只在 t>=1.0 做一次。所有 runtime 拷贝都配对 free（内存铁律）。
+static void splash_adblock_jdDumpClasses(void) {
+    if (splash_adblock_jdClassDumped || !splash_adblock_jdProbeActive()) return;
+    splash_adblock_jdClassDumped = YES;
+    unsigned int count = 0;
+    Class *classes = objc_copyClassList(&count);
+    if (!classes) return;
+    NSMutableArray *hits = [NSMutableArray array];
+    for (unsigned int i = 0; i < count; i++) {
+        const char *cn = class_getName(classes[i]);
+        if (!cn) continue;
+        NSString *name = [NSString stringWithUTF8String:cn];
+        if (!name) continue;
+        if (splash_adblock_jdNameLooksLikeAd(name)) {
+            [hits addObject:name];
+            if (hits.count >= 50) break;
+        }
+    }
+    free(classes);
+    splash_adblock_log([NSString stringWithFormat:@"[jd][cls] total candidates=%ld", (long)hits.count]);
+    for (NSString *name in hits) {
+        splash_adblock_log([NSString stringWithFormat:@"[jd][cls] %@", name]);
+    }
+    NSInteger dumped = 0;
+    for (NSString *name in hits) {
+        if (dumped >= 5) break;
+        Class c = NSClassFromString(name);
+        if (!c) continue;
+        unsigned int mcount = 0;
+        Method *methods = class_copyMethodList(c, &mcount);
+        if (!methods) continue;
+        NSMutableArray *sels = [NSMutableArray array];
+        for (unsigned int j = 0; j < mcount; j++) {
+            if (sels.count >= 35) break;
+            [sels addObject:NSStringFromSelector(method_getName(methods[j]))];
+        }
+        free(methods);
+        splash_adblock_log([NSString stringWithFormat:@"[jd][meth] %@ -> %@",
+                            name, [sels componentsJoinedByString:@","]]);
+        dumped++;
+    }
+}
+
+// 6 个一次性快照 + 1 次类名 dump；11s 自然结束，无常驻任务。
+static void splash_adblock_jdStartProbe(void) {
+    if (!splash_adblock_enabled() || !splash_adblock_isJD()) return;
+    splash_adblock_jdLaunchTime = [[NSDate date] timeIntervalSince1970];
+    splash_adblock_log(@"[jd] probe armed: 20s window, 6 snapshots, no UI change");
+    NSArray *ticks = @[@0.4, @1.0, @2.0, @4.0, @7.0, @11.0];
+    for (NSNumber *t in ticks) {
+        double delay = t.doubleValue;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (!splash_adblock_jdProbeActive()) return;
+            splash_adblock_jdDumpWindows([NSString stringWithFormat:@"t%.1f", delay]);
+            if (delay >= 1.0) splash_adblock_jdDumpClasses();
+        });
+    }
+}
+
 // 窗口级同步处理：比任何 tick 都早（UIKit 加完子视图、绘制首帧之前）。
 // v0.5.0：这里**只调层级（沉底），绝不改 alpha** —— 提前 alpha=0 会被优量汇判成
 // "展示失败"，开屏计时器不启动，App 卡在黑屏（v0.4.9 教训）。
@@ -1420,6 +1613,11 @@ static void splash_adblock_wpInstallSplashHook(void) {
 - (void)didAddSubview:(UIView *)subview {
     %orig;
     if (!subview) return;
+    // 京东诊断期只记录、不碰 UI（不改 alpha / 不动层级 / 不移除）。
+    if (splash_adblock_isJD()) {
+        splash_adblock_jdOnAddSubview(self, subview);
+        return;
+    }
     if (!splash_adblock_wpActive() || !splash_adblock_wpShieldActive()) return;
     UIWindow *w = self;
     if (w.windowLevel > 100) return;                       // 键盘/状态栏/系统弹层
@@ -1797,6 +1995,9 @@ static inline double splash_adblock_zhiboElapsed(void) {
 
     %orig;
 
+    // ---- 京东诊断：记录所有 present 的 VC，定位开屏广告的真实类名 ----
+    if (splash_adblock_isJD()) splash_adblock_jdOnPresent(vc);
+
     if (!splash_adblock_enabled()) return;
 
     // ---- 闪联评分弹窗 ----
@@ -1865,6 +2066,9 @@ static inline double splash_adblock_zhiboElapsed(void) {
     %orig;
     NSString *cls = NSStringFromClass([self class]);
 
+    // ---- 京东诊断：记录所有出现的 VC（开屏可能不是 present 出来的） ----
+    if (splash_adblock_isJD()) splash_adblock_jdOnAppear(self);
+
     // ---- 直播吧：命中广告特征 VC -> 事件驱动兜底（一次性延迟补刀） ----
     if (splash_adblock_zhiboProbeActive()) {
         if (splash_adblock_zhiboVCCount < 60) {
@@ -1922,5 +2126,6 @@ static inline double splash_adblock_zhiboElapsed(void) {
         splash_adblock_xcfInstallPlaceholderHook();
         splash_adblock_wpStartProtection();
         splash_adblock_wpInstallSplashHook();
+        splash_adblock_jdStartProbe();      // 京东：偶发开屏广告取证（只记录，不改 UI）
     }
 }

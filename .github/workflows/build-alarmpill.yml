@@ -1,0 +1,35 @@
+name: Build AlarmPill (.deb)
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install dpkg
+        run: brew install dpkg || true
+
+      - name: Install roothide Theos
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash -c "$(curl -fsSL https://raw.githubusercontent.com/roothide/theos/master/bin/install-theos)"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+          echo "$HOME/theos/bin" >> "$GITHUB_PATH"
+
+      - name: Build .deb
+        working-directory: ./AlarmPill
+        run: make clean && make package THEOS_PACKAGE_SCHEME=roothide
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AlarmPill-deb
+          path: AlarmPill/packages/*.deb
+          if-no-files-found: error

@@ -1,0 +1,8 @@
+Package: com.yourname.alarmpill
+Name: 隐藏睡眠闹钟胶囊
+Version: 0.0.3
+Architecture: iphoneos-arm64
+Description: 隐藏 iOS 17 锁屏时间下方、睡眠模式下显示的闹钟胶囊，不影响时间和日期。事件驱动拦截（不轮询）；探测有上限、兜底扫描有额度、默认不写日志。适用于 RootHide 隐根环境。
+Maintainer: hzy
+Author: hzy
+Section: Tweaks

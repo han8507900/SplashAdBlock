@@ -4,7 +4,7 @@
 #import "SplashAdBlockPrivate.h"
 
 // ============================================================================
-// 通用屏蔽插件（v0.5.4）
+// 通用屏蔽插件（v0.5.5）
 //
 // 已精准适配（v0.5.1 之前的屏蔽逻辑一行未改）：
 //  · 掌盟 com.tencent.ied.app.lolbible —— 广点通 GDT 开屏（透明化）
@@ -25,6 +25,12 @@
 //                                        + 启动期 openURL/App Store 页拦截（v0.5.1 定版）
 //  · 京东   com.360buy.jdmobile         —— 开屏官方判定 canShowLaunchADView -> NO
 //                                        （竞品 REA 逆向，App 自己走 startMain 进主界面，v0.5.4 定版）
+//  · 小翼管家 com.chinatelecom.tygq     —— v0.5.5 诊断中：开屏广告，先取证不屏蔽。
+//
+// v0.5.5 小翼管家诊断（用户反馈"有开屏广告"）：
+//  · plist 新增 com.chinatelecom.tygq（第 11 个 App）；日志白名单临时指向小翼管家；
+//  · 只做探针：窗口快照/present/appear/加子视图/类名与方法签名，20s 封顶、不改 UI；
+//  · 单文件固定覆盖写（每次都有广告，无需京东那种 6 槽位）；定版后必须关日志、删整个探针。
 //
 // v0.5.4 定版（v0.5.3 真机两份日志确认命中：`[jd][HOOK] installed`、`[jd][BLOCK] orig=YES -> NO`，
 //  且 t0.4 起就是正常主界面、无广告无黑屏；用户京东版本 171012/16.0.70 与竞品逆向版本不同，
@@ -279,16 +285,23 @@ static BOOL splash_adblock_isJD(void) {
     return [b isEqualToString:@"com.360buy.jdmobile"];
 }
 
+static BOOL splash_adblock_isTYGQ(void) {
+    NSString *b = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+    return [b isEqualToString:@"com.chinatelecom.tygq"];
+}
+
 // ---------- 轻量日志（按需开关，无常驻监听、无轮询） ----------
-#define SPLASH_ADBLOCK_VERSION @"0.5.4"
+#define SPLASH_ADBLOCK_VERSION @"0.5.5"
 
 // 日志默认关闭：已定版 App 每次启动不再生成任何日志文件。
 // 接入新 App 做诊断时，这里临时指向它的 bundle，真机验证通过后**下一版必须改回 NO**。
 // 变更记录：百度地图 v0.3.0 诊断→v0.3.1 定版；12306 v0.3.1 诊断→v0.3.2 定版；
 //          下厨房 v0.3.2~v0.3.4 诊断→v0.3.5 定版；威锋 v0.4.0~v0.5.0 诊断→v0.5.1 定版；
-//          京东 v0.5.2 诊断→v0.5.3 开屏修复→v0.5.4 定版。
+//          京东 v0.5.2 诊断→v0.5.3 开屏修复→v0.5.4 定版；
+//          小翼管家 v0.5.5 诊断中（定版后必须改回 NO）。
 static BOOL splash_adblock_logEnabled(void) {
-    return NO;
+    NSString *bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
+    return [bundle isEqualToString:@"com.chinatelecom.tygq"];
 }
 
 // 本次会话的唯一标志（版本号 + 启动时间戳），进程内只生成一次。
@@ -1437,10 +1450,20 @@ static void splash_adblock_wpInstallSplashHook(void) {
 // 窗口级同步处理：比任何 tick 都早（UIKit 加完子视图、绘制首帧之前）。
 // v0.5.0：这里**只调层级（沉底），绝不改 alpha** —— 提前 alpha=0 会被优量汇判成
 // "展示失败"，开屏计时器不启动，App 卡在黑屏（v0.4.9 教训）。
+// 小翼管家探针前向声明（实现在文件后段，调用点在上方 hook 内）
+static void splash_adblock_tyOnAddSubview(UIWindow *w, UIView *v);
+static void splash_adblock_tyOnPresent(UIViewController *vc);
+static void splash_adblock_tyOnAppear(UIViewController *vc);
+
 %hook UIWindow
 - (void)didAddSubview:(UIView *)subview {
     %orig;
     if (!subview) return;
+    // 小翼管家诊断期只记录、不碰 UI（不改 alpha / 不动层级 / 不移除）。
+    if (splash_adblock_isTYGQ()) {
+        splash_adblock_tyOnAddSubview(self, subview);
+        return;
+    }
     if (!splash_adblock_wpActive() || !splash_adblock_wpShieldActive()) return;
     UIWindow *w = self;
     if (w.windowLevel > 100) return;                       // 键盘/状态栏/系统弹层
@@ -1878,6 +1901,9 @@ static inline double splash_adblock_zhiboElapsed(void) {
         }
     }
 
+    // ---- 小翼管家诊断：记录所有 present 的 VC，定位开屏广告真实类名 ----
+    if (splash_adblock_isTYGQ()) splash_adblock_tyOnPresent(vc);
+
     // v0.1.9：微博开屏靠「精准 fade + 广告 VC viewDidAppear 提前切主界面」，无探针。
     // v0.3.3：下厨房开屏靠精准 hook BeiZiSplash 吞加载（见上），无全局探针。
 }
@@ -1915,6 +1941,9 @@ static inline double splash_adblock_zhiboElapsed(void) {
         splash_adblock_fadeTree(self.view);
     }
 
+    // ---- 小翼管家诊断：记录所有出现的 VC（开屏可能不是 present 出来的） ----
+    if (splash_adblock_isTYGQ()) splash_adblock_tyOnAppear(self);
+
     // ---- 威锋：开屏 VC（present 之外的形态，如 root/child 直接挂载）同样透明化 + dismiss ----
     if (splash_adblock_wpActive() && splash_adblock_wpProbeActive()
         && splash_adblock_wpLooksLikeSplash(cls)) {
@@ -1933,6 +1962,156 @@ static inline double splash_adblock_zhiboElapsed(void) {
     return show;
 }
 %end
+
+#pragma mark - 小翼管家：开屏广告诊断探针（v0.5.5 临时，定版必须整体移除）
+
+// 小翼管家 com.chinatelecom.tygq：先只取证、不改任何 UI（不动 alpha / 不动层级 / 不移除）。
+// 严格封顶：20s 后自动失效；6 次窗口快照；70 条加子视图；60 条 present；60 条 VC；
+// 类名只 dump 一次（objc_copyClassList / class_copyMethodList 全部配对 free）。
+// 无 NSTimer、无观察者、无常驻轮询；全部是一次性 dispatch_after，11s 结束。
+static NSTimeInterval splash_adblock_tyLaunchTime = 0;
+static NSInteger splash_adblock_tyAddCount = 0;
+static NSInteger splash_adblock_tyPresentCount = 0;
+static NSInteger splash_adblock_tyAppearCount = 0;
+static NSInteger splash_adblock_tyDumpCount = 0;
+static BOOL splash_adblock_tyClassDumped = NO;
+
+static BOOL splash_adblock_tyProbeActive(void) {
+    if (!splash_adblock_enabled() || !splash_adblock_isTYGQ()) return NO;
+    if (splash_adblock_tyLaunchTime <= 0) {
+        splash_adblock_tyLaunchTime = [[NSDate date] timeIntervalSince1970];
+    }
+    return ([[NSDate date] timeIntervalSince1970] - splash_adblock_tyLaunchTime) < 20.0;
+}
+
+// 广告类名特征：第三方 SDK + 电信/天翼系自研前缀。
+static BOOL splash_adblock_tyNameLooksLikeAd(NSString *n) {
+    if (!n) return NO;
+    NSString *l = [n lowercaseString];
+    NSArray *keys = @[@"splash", @"flash", @"startup", @"launchad", @"openad",
+                      @"adview", @"adsdk", @"gdt", @"csj", @"pangolin", @"bumble",
+                      @"screenad", @"ctad", @"tyad", @"tianyi", @"admanager",
+                      @"adcontroller", @"splashview", @"launchscreen"];
+    for (NSString *k in keys) {
+        if ([l rangeOfString:k].location != NSNotFound) return YES;
+    }
+    return NO;
+}
+
+static NSString *splash_adblock_tyBrief(UIView *v) {
+    if (!v) return @"(nil)";
+    return [NSString stringWithFormat:@"%@ f=%@ a=%.2f h=%d",
+            NSStringFromClass([v class]), NSStringFromCGRect(v.frame), v.alpha, v.hidden ? 1 : 0];
+}
+
+static void splash_adblock_tyOnAddSubview(UIWindow *w, UIView *v) {
+    if (!splash_adblock_tyProbeActive() || splash_adblock_tyAddCount >= 70) return;
+    splash_adblock_tyAddCount++;
+    splash_adblock_log([NSString stringWithFormat:@"[ty][add #%ld] win=%@ %@",
+        (long)splash_adblock_tyAddCount, NSStringFromClass([w class]), splash_adblock_tyBrief(v)]);
+}
+
+static void splash_adblock_tyOnPresent(UIViewController *vc) {
+    if (!vc || !splash_adblock_tyProbeActive() || splash_adblock_tyPresentCount >= 60) return;
+    splash_adblock_tyPresentCount++;
+    NSString *n = NSStringFromClass([vc class]);
+    splash_adblock_log([NSString stringWithFormat:@"[ty][present #%ld] VC=%@ %@%@",
+        (long)splash_adblock_tyPresentCount, n, splash_adblock_tyBrief(vc.view),
+        splash_adblock_tyNameLooksLikeAd(n) ? @"  <<< AD-LIKE" : @""]);
+}
+
+static void splash_adblock_tyOnAppear(UIViewController *vc) {
+    if (!vc || !splash_adblock_tyProbeActive() || splash_adblock_tyAppearCount >= 60) return;
+    splash_adblock_tyAppearCount++;
+    NSString *n = NSStringFromClass([vc class]);
+    splash_adblock_log([NSString stringWithFormat:@"[ty][appear #%ld] VC=%@ %@%@",
+        (long)splash_adblock_tyAppearCount, n, splash_adblock_tyBrief(vc.view),
+        splash_adblock_tyNameLooksLikeAd(n) ? @"  <<< AD-LIKE" : @""]);
+}
+
+static void splash_adblock_tyDumpWindows(NSString *why) {
+    if (!splash_adblock_tyProbeActive() || splash_adblock_tyDumpCount >= 6) return;
+    splash_adblock_tyDumpCount++;
+    for (UIWindow *w in [[UIApplication sharedApplication] windows]) {
+        splash_adblock_log([NSString stringWithFormat:
+            @"[ty][win %@] %@ level=%.0f key=%d root=%@ f=%@ a=%.2f h=%d",
+            why, NSStringFromClass([w class]), w.windowLevel, w.isKeyWindow ? 1 : 0,
+            NSStringFromClass([w.rootViewController class]) ?: @"(nil)",
+            NSStringFromCGRect(w.frame), w.alpha, w.hidden ? 1 : 0]);
+        NSInteger subs = 0;
+        for (UIView *sub in [w.subviews copy]) {
+            if (subs++ >= 5) break;
+            splash_adblock_log([NSString stringWithFormat:@"[ty][  sub %@] %@", why,
+                                splash_adblock_tyBrief(sub)]);
+            NSInteger inner = 0;
+            for (UIView *s2 in [sub.subviews copy]) {
+                if (inner++ >= 3) break;
+                splash_adblock_log([NSString stringWithFormat:@"[ty][    in %@] %@", why,
+                                    splash_adblock_tyBrief(s2)]);
+            }
+        }
+    }
+}
+
+// 类名 + 方法签名：只在 t>=1.0 做一次。所有 runtime 拷贝都配对 free（内存铁律）。
+static void splash_adblock_tyDumpClasses(void) {
+    if (splash_adblock_tyClassDumped || !splash_adblock_tyProbeActive()) return;
+    splash_adblock_tyClassDumped = YES;
+    unsigned int count = 0;
+    Class *classes = objc_copyClassList(&count);
+    if (!classes) return;
+    NSMutableArray *hits = [NSMutableArray array];
+    for (unsigned int i = 0; i < count; i++) {
+        const char *cn = class_getName(classes[i]);
+        if (!cn) continue;
+        NSString *name = [NSString stringWithUTF8String:cn];
+        if (!name) continue;
+        if (splash_adblock_tyNameLooksLikeAd(name)) {
+            [hits addObject:name];
+            if (hits.count >= 50) break;
+        }
+    }
+    free(classes);
+    splash_adblock_log([NSString stringWithFormat:@"[ty][cls] total candidates=%ld", (long)hits.count]);
+    for (NSString *name in hits) {
+        splash_adblock_log([NSString stringWithFormat:@"[ty][cls] %@", name]);
+    }
+    NSInteger dumped = 0;
+    for (NSString *name in hits) {
+        if (dumped >= 5) break;
+        Class c = NSClassFromString(name);
+        if (!c) continue;
+        unsigned int mcount = 0;
+        Method *methods = class_copyMethodList(c, &mcount);
+        if (!methods) continue;
+        NSMutableArray *sels = [NSMutableArray array];
+        for (unsigned int j = 0; j < mcount; j++) {
+            if (sels.count >= 35) break;
+            [sels addObject:NSStringFromSelector(method_getName(methods[j]))];
+        }
+        free(methods);
+        splash_adblock_log([NSString stringWithFormat:@"[ty][meth] %@ -> %@",
+                            name, [sels componentsJoinedByString:@","]]);
+        dumped++;
+    }
+}
+
+// 6 个一次性快照 + 1 次类名 dump；11s 自然结束，无常驻任务。
+static void splash_adblock_tyStartProbe(void) {
+    if (!splash_adblock_enabled() || !splash_adblock_isTYGQ()) return;
+    splash_adblock_tyLaunchTime = [[NSDate date] timeIntervalSince1970];
+    splash_adblock_log(@"[ty] probe armed: 20s window, 6 snapshots, no UI change");
+    NSArray *ticks = @[@0.4, @1.0, @2.0, @4.0, @7.0, @11.0];
+    for (NSNumber *t in ticks) {
+        double delay = t.doubleValue;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (!splash_adblock_tyProbeActive()) return;
+            splash_adblock_tyDumpWindows([NSString stringWithFormat:@"t%.1f", delay]);
+            if (delay >= 1.0) splash_adblock_tyDumpClasses();
+        });
+    }
+}
 
 %ctor {
     @autoreleasepool {
@@ -1954,5 +2133,6 @@ static inline double splash_adblock_zhiboElapsed(void) {
         splash_adblock_xcfInstallPlaceholderHook();
         splash_adblock_wpStartProtection();
         splash_adblock_wpInstallSplashHook();
+        splash_adblock_tyStartProbe();     // 小翼管家：开屏广告取证（只记录，不改 UI）
     }
 }

@@ -4,7 +4,7 @@
 #import "SplashAdBlockPrivate.h"
 
 // ============================================================================
-// 通用屏蔽插件（v0.5.2）
+// 通用屏蔽插件（v0.5.3）
 //
 // 已精准适配（v0.5.1 之前的屏蔽逻辑一行未改）：
 //  · 掌盟 com.tencent.ied.app.lolbible —— 广点通 GDT 开屏（透明化）
@@ -23,8 +23,15 @@
 //                                        容器挡住（不动 alpha，保住曝光判定）+ tick 兜底
 //                                        + 断言覆盖式全屏 + 走"跳过"dismiss
 //                                        + 启动期 openURL/App Store 页拦截（v0.5.1 定版）
-//  · 京东   com.360buy.jdmobile         —— v0.5.2 诊断中：偶发开屏广告，先取证不屏蔽。
-//                                        日志 6 槽位循环覆盖（保留"有广告那次"）。
+//  · 京东   com.360buy.jdmobile         —— 开屏官方判定 canShowLaunchADView -> NO
+//                                        （竞品 REA 逆向，App 自己走 startMain 进主界面）
+//
+// v0.5.3 京东开屏修复（诊断 6 次无广告，靠竞品 REA 逆向定位到官方判定）：
+//  · 依据 SOLHK/JDX 的 REA 静态逆向：-[LaunchAnimationManager canShowLaunchADView]
+//    返回 YES=要展示开屏，冷启动/展示回调两处都读它，返回 NO 后 App 走 startMain。
+//  · runtime 动态安装（先调 orig 保住判断链，orig=YES 才改判 NO），构造期打印
+//    `[jd][HOOK] installed/missing ver=... build=...` 确认命中；不硬编码版本。
+//  · 探针与 6 槽位日志暂留一轮用于真机确认，定版必须关日志、删探针、清槽位。
 //
 // v0.5.2 京东诊断（用户反馈"打开有广告，但不是每次都有"）：
 //  · plist 新增 com.360buy.jdmobile；日志白名单临时指向京东；
@@ -272,13 +279,13 @@ static BOOL splash_adblock_isJD(void) {
 }
 
 // ---------- 轻量日志（按需开关，无常驻监听、无轮询） ----------
-#define SPLASH_ADBLOCK_VERSION @"0.5.2"
+#define SPLASH_ADBLOCK_VERSION @"0.5.3"
 
 // 日志默认关闭：已定版 App 每次启动不再生成任何日志文件。
 // 接入新 App 做诊断时，这里临时指向它的 bundle，真机验证通过后**下一版必须改回 NO**。
 // 变更记录：百度地图 v0.3.0 诊断→v0.3.1 定版；12306 v0.3.1 诊断→v0.3.2 定版；
 //          下厨房 v0.3.2~v0.3.4 诊断→v0.3.5 定版；威锋 v0.4.0~v0.5.0 诊断→v0.5.1 定版；
-//          京东 v0.5.2 诊断中（偶发开屏广告，需多次冷启动取证）。
+//          京东 v0.5.2 诊断→v0.5.3 开屏修复（验证通过后定版）。
 static BOOL splash_adblock_logEnabled(void) {
     NSString *bundle = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
     return [bundle isEqualToString:@"com.360buy.jdmobile"];
@@ -1464,6 +1471,27 @@ static void splash_adblock_wpInstallSplashHook(void) {
 // 类名只 dump 一次（objc_copyClassList / class_copyMethodList 全部配对 free）。
 // 无 NSTimer、无观察者、无常驻轮询；全部是一次性 dispatch_after，11s 结束。
 
+// ---- v0.5.3：京东开屏精准 hook（依据 SOLHK/JDX 的 REA 静态逆向，非猜测） ----
+// 官方判定 -[LaunchAnimationManager canShowLaunchADView]：YES=要展示开屏，NO=不展示。
+// 竞品逆向确认冷启动 0x1004025c8 与展示回调 0x103e7f934 两处都读它，返回 NO 后
+// App 自己走 startMain 进主界面 —— 与百度地图 isSplashShowClosed 同构，安全。
+// 跟随竞品 replacement：先调 orig 保住展示判断链，只在 orig=YES 时改判 NO。
+// 用 Logos %hook（substrate/MSHookMessageEx）而非构造期 runtime：LaunchAnimationManager
+// 是懒加载类，构造期 objc_getClass 可能拿不到；substrate 会挂起 hook，类注册时自动应用。
+static NSInteger splash_adblock_jdBlocked = 0;
+static NSInteger splash_adblock_jdHookHits = 0;
+
+// %hook LaunchAnimationManager 见下方独立 hook 块；这里只放状态与日志辅助。
+static void splash_adblock_jdLogVersionOnce(void) {
+    static BOOL logged = NO;
+    if (logged) return;
+    logged = YES;
+    NSBundle *b = [NSBundle mainBundle];
+    splash_adblock_log([NSString stringWithFormat:@"[jd][HOOK] installed ver=%@ build=%@",
+        [b objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?",
+        [b objectForInfoDictionaryKey:@"CFBundleVersion"] ?: @"?"]);
+}
+
 static NSTimeInterval splash_adblock_jdLaunchTime = 0;
 static NSInteger splash_adblock_jdAddCount = 0;
 static NSInteger splash_adblock_jdPresentCount = 0;
@@ -2103,6 +2131,29 @@ static inline double splash_adblock_zhiboElapsed(void) {
         && splash_adblock_wpLooksLikeSplash(cls)) {
         splash_adblock_wpHandleSplashVC(self, @"viewDidAppear");
     }
+}
+%end
+
+// ---- v0.5.3 京东开屏：官方判定 canShowLaunchADView -> NO（竞品 REA 逆向确认） ----
+// 先调 orig 保住展示判断链；只在 orig=YES（本要展示广告）时改判 NO，App 自己走
+// startMain 进主界面。类不存在时 substrate 不 hook，零影响。
+%hook LaunchAnimationManager
+- (BOOL)canShowLaunchADView {
+    BOOL show = %orig;
+    if (splash_adblock_enabled() && splash_adblock_isJD()) {
+        splash_adblock_jdLogVersionOnce();
+        if (splash_adblock_jdHookHits < 20) splash_adblock_jdHookHits++;
+        if (show) {
+            if (splash_adblock_jdBlocked < 20) splash_adblock_jdBlocked++;
+            splash_adblock_log([NSString stringWithFormat:
+                @"[jd][BLOCK #%ld] canShowLaunchADView orig=YES -> NO (hit#%ld)",
+                (long)splash_adblock_jdBlocked, (long)splash_adblock_jdHookHits]);
+            return NO;
+        }
+        splash_adblock_log([NSString stringWithFormat:
+            @"[jd][HOOK hit#%ld] orig=NO (native no-ad decision)", (long)splash_adblock_jdHookHits]);
+    }
+    return show;
 }
 %end
 
